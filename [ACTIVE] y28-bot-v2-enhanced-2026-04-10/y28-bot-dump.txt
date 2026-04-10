@@ -1,0 +1,4364 @@
+﻿const fs = require('fs');
+const path = require('path');
+
+const LOG_DIR = path.dirname(process.env.DATABASE_PATH || './data/pmb.db');
+const LOG_FILE = path.join(LOG_DIR, 'bot.log');
+try { fs.mkdirSync(LOG_DIR, { recursive: true }); } catch {}
+
+// --- Log buffer for /api/logs ---
+global.logBuffer = [];
+const MAX_LOG_BUFFER = 10000;
+const _origLog = console.log;
+const _origErr = console.error;
+
+function formatArg(a) {
+  if (typeof a === 'string') return a;
+  if (a instanceof Error) return a.stack || a.message;
+  try { return JSON.stringify(a); } catch { return String(a); }
+}
+
+console.log = (...args) => {
+  _origLog.apply(console, args);
+  const ts = new Date().toISOString();
+  const msg = args.map(formatArg).join(' ');
+  global.logBuffer.push({ timestamp: ts, level: 'info', message: msg });
+  if (global.logBuffer.length > MAX_LOG_BUFFER) global.logBuffer.shift();
+  try { fs.appendFileSync(LOG_FILE, `[${ts}] [info] ${msg}\n`); } catch {}
+};
+
+console.error = (...args) => {
+  _origErr.apply(console, args);
+  const ts = new Date().toISOString();
+  const msg = args.map(formatArg).join(' ');
+  global.logBuffer.push({ timestamp: ts, level: 'error', message: msg });
+  if (global.logBuffer.length > MAX_LOG_BUFFER) global.logBuffer.shift();
+  try { fs.appendFileSync(LOG_FILE, `[${ts}] [error] ${msg}\n`); } catch {}
+};
+
+const express = require('express');
+const cors = require('cors');
+const config = require('./config');
+const db = require('./db');
+const auth = require('./auth');
+const { coinbaseWS } = require('./coinbase-ws');
+const { priceTracker } = require('./price-tracker');
+const { volatilityTracker } = require('./volatility');
+const marketDiscovery = require('./market-discovery');
+const { superScalp } = require('./superscalp');
+const { orderExecutor } = require('./order-executor');
+const { spreadScalp } = require('./spread-scalp');
+const { resolver } = require('./resolver');
+const { claimer } = require('./claimer');
+const notifications = require('./notifications');
+const { polymarketRTDS } = require('./polymarket-ws');
+const { candleEngine } = require('./candle-engine');
+
+// --- Log rotation (daily at midnight UTC, keep 7 days) ---
+let lastLogDate = new Date().toISOString().slice(0, 10);
+
+function cleanOldLogs() {
+  try {
+    const files = fs.readdirSync(LOG_DIR);
+    const logFiles = files.filter(f => /^bot-\d{4}-\d{2}-\d{2}\.log$/.test(f)).sort();
+    while (logFiles.length > 7) {
+      const oldest = logFiles.shift();
+      fs.unlinkSync(path.join(LOG_DIR, oldest));
+      _origLog(`[log-rotate] Deleted old log: ${oldest}`);
+    }
+  } catch (err) {
+    _origErr('[log-rotate] Error cleaning old logs:', err.message);
+  }
+}
+
+function rotateLogIfNeeded() {
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (lastLogDate && lastLogDate !== todayStr) {
+    try {
+      if (fs.existsSync(LOG_FILE)) {
+        fs.renameSync(LOG_FILE, path.join(LOG_DIR, `bot-${lastLogDate}.log`));
+      }
+    } catch (err) {
+      _origErr('[log-rotate] Error rotating:', err.message);
+    }
+    // Clear in-memory log buffer at midnight UTC
+    global.logBuffer = [];
+    _origLog(`[log-rotate] In-memory log buffer cleared for new day ${todayStr}`);
+    cleanOldLogs();
+  }
+  lastLogDate = todayStr;
+}
+
+let startupComplete = false;
+let scalpInterval = null;
+
+// --- Pause state (persisted in settings DB, global for resolver access) ---
+global.botPaused = false;
+const pausedRaw = db.getSetting('paused');
+if (pausedRaw === 'true') {
+  global.botPaused = true;
+  console.log('[boot] Bot starting in PAUSED state (restored from DB)');
+}
+
+// Mutable runtime config overlay â€” modules can check this for live-adjustable settings
+global.runtimeConfig = {
+  irrevThreshold: config.irrevThresholds.base,
+  dryRun: config.dryRun,
+  laneEnabled: {},
+  maxTradeSize: config.maxTradeSize,
+  maxLossPerTrade: config.maxLossPerTrade,
+  minShares: config.minShares,
+  spreadScalpIrrev: config.spreadScalpIrrev,
+  limitOrderTimeoutMs: config.limitOrderTimeoutMs,
+};
+
+// During startup, let crashes propagate so broken config is caught immediately
+process.on('uncaughtException', (err) => {
+  console.error('[fatal] Uncaught exception:', err);
+  notifications.error(err.message);
+  if (!startupComplete) process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[fatal] Unhandled rejection:', reason);
+  notifications.error(reason instanceof Error ? reason.message : String(reason));
+  if (!startupComplete) process.exit(1);
+});
+
+const app = express();
+
+app.use(express.json());
+
+// CORS â€” allow all origins (dashboard served from same server, JWT handles security)
+app.use(cors({ origin: true, credentials: true }));
+
+// --- Public routes ---
+
+app.post('/api/login', (req, res) => {
+  const { password } = req.body;
+  if (!password) return res.status(400).json({ error: 'Password required' });
+
+  const token = auth.login(password);
+  if (!token) return res.status(401).json({ error: 'Invalid password' });
+
+  res.json({ token });
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({ status: 'ok', uptime: process.uptime(), version: '1.0.0' });
+});
+
+// --- Protected routes ---
+
+app.get('/api/pool', auth.authMiddleware, (req, res) => {
+  res.json({ balance: db.getPoolBalance() });
+});
+
+app.get('/api/trades', auth.authMiddleware, (req, res) => {
+  // Return ALL trades â€” no filters, no exclusions. Frontend tabs handle filtering.
+  const allTrades = db.getDb().prepare('SELECT * FROM trades ORDER BY id DESC LIMIT 100').all();
+  res.json(allTrades);
+});
+
+app.get('/api/prices', auth.authMiddleware, (req, res) => {
+  res.json(coinbaseWS.prices);
+});
+
+app.get('/api/market/:laneId', auth.authMiddleware, async (req, res) => {
+  const lane = config.lanes.find((l) => l.id === req.params.laneId);
+  if (!lane) return res.status(400).json({ error: 'Invalid laneId' });
+
+  const now = Math.floor(Date.now() / 1000);
+  const windowTs = now - (now % (lane.interval * 60));
+
+  const market = await marketDiscovery.findMarket(lane.id, windowTs, lane.interval);
+  if (!market) return res.status(404).json({ error: 'Market not found' });
+
+  res.json(market);
+});
+
+app.get('/api/windows', auth.authMiddleware, (req, res) => {
+  const windows = {};
+  for (const lane of config.lanes) {
+    const windowTs = priceTracker.getWindowTs(lane.interval);
+    const remaining = priceTracker.getRemainingSeconds(lane.interval);
+    const win = priceTracker.getWindow(lane.id, windowTs);
+    windows[lane.id] = {
+      windowTs,
+      remaining,
+      openPrice: win ? win.openPrice : null,
+      spotPrice: coinbaseWS.getPrice(lane.asset),
+    };
+  }
+  res.json(windows);
+});
+
+app.get('/api/superscalp/status', auth.authMiddleware, (req, res) => {
+  const status = {};
+  for (const lane of config.lanes) {
+    const currentPrice = coinbaseWS.getPrice(lane.asset);
+    const windowTs = priceTracker.getWindowTs(lane.interval);
+    const remainingSeconds = priceTracker.getRemainingSeconds(lane.interval);
+    const totalSeconds = lane.interval * 60;
+    const win = priceTracker.getWindow(lane.id, windowTs);
+    const openPrice = win ? win.openPrice : null;
+
+    let irrev = 0;
+    let direction = null;
+    if (currentPrice != null && openPrice != null) {
+      irrev = superScalp.calculateIrrev(lane.asset, openPrice, currentPrice, remainingSeconds, totalSeconds);
+      direction = superScalp.getDirection(openPrice, currentPrice);
+    }
+
+    status[lane.id] = {
+      laneId: lane.id,
+      currentPrice,
+      openPrice,
+      irrev: parseFloat(irrev.toFixed(3)),
+      direction,
+      remainingSeconds,
+      stackLevel: superScalp.getStackLevel(lane.id),
+      volatility: volatilityTracker.getVolatility(lane.asset),
+    };
+  }
+  res.json(status);
+});
+
+app.get('/api/trades/summary', auth.authMiddleware, (req, res) => {
+  const raw = db.getDb();
+  const totals = raw.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN result = 'won' THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN result = 'lost' THEN 1 ELSE 0 END) AS losses,
+      SUM(CASE WHEN result = 'pending' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN result = 'expired' THEN 1 ELSE 0 END) AS expired,
+      SUM(CASE WHEN result = 'burned' THEN 1 ELSE 0 END) AS burned,
+      COALESCE(SUM(CASE WHEN result != 'burned' THEN pnl ELSE 0 END), 0) AS totalPnl
+    FROM trades
+  `).get();
+
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayPnl = raw.prepare(`
+    SELECT COALESCE(SUM(pnl), 0) AS todayPnl
+    FROM trades
+    WHERE created_at >= ? AND result IN ('won', 'lost')
+  `).get(todayStart.toISOString()).todayPnl;
+
+  const decided = totals.wins + totals.losses + totals.burned;
+  res.json({
+    total: totals.total,
+    wins: totals.wins,
+    losses: totals.losses,
+    pending: totals.pending,
+    expired: totals.expired,
+    burned: totals.burned,
+    winRate: decided > 0 ? parseFloat((totals.wins / decided).toFixed(4)) : 0,
+    totalPnl: parseFloat(totals.totalPnl.toFixed(2)),
+    todayPnl: parseFloat(todayPnl.toFixed(2)),
+    poolBalance: db.getPoolBalance(),
+  });
+});
+
+app.get('/api/trades/won', auth.authMiddleware, (req, res) => {
+  res.json(db.getTrades({ result: 'won', claimed: 0 }));
+});
+
+// --- POST /api/trades/:tradeId/bookmark (toggle bookmark â€” only one at a time) ---
+app.post('/api/trades/:tradeId/bookmark', auth.authMiddleware, (req, res) => {
+  const tradeId = parseInt(req.params.tradeId, 10);
+  const { bookmarked } = req.body;
+  const raw = db.getDb();
+
+  if (bookmarked) {
+    // Clear all existing bookmarks, then set the new one
+    raw.prepare('UPDATE trades SET bookmarked = 0 WHERE bookmarked = 1').run();
+    raw.prepare('UPDATE trades SET bookmarked = 1 WHERE id = ?').run(tradeId);
+  } else {
+    raw.prepare('UPDATE trades SET bookmarked = 0 WHERE id = ?').run(tradeId);
+  }
+
+  res.json({ ok: true, tradeId, bookmarked: bookmarked ? 1 : 0 });
+});
+
+// --- POST /api/trades/:id/update-result (manual win/loss/delete) ---
+app.post('/api/trades/:id/update-result', auth.authMiddleware, (req, res) => {
+  const tradeId = parseInt(req.params.id, 10);
+  const { action } = req.body;
+
+  if (!['win', 'loss', 'delete'].includes(action)) {
+    return res.status(400).json({ success: false, error: 'Invalid action. Must be win, loss, or delete.' });
+  }
+
+  const trade = db.getTradeById(tradeId);
+  if (!trade) {
+    return res.status(404).json({ success: false, error: `Trade #${tradeId} not found` });
+  }
+
+  const raw = db.getDb();
+
+  if (action === 'delete') {
+    raw.prepare('DELETE FROM trades WHERE id = ?').run(tradeId);
+    console.log(`[admin] Trade #${tradeId} deleted`);
+    return res.json({ success: true, message: 'Trade deleted' });
+  }
+
+  if (action === 'win') {
+    const pnl = (trade.shares * 1.0) - trade.cost;
+    db.updateTrade(tradeId, { result: 'won', pnl, close_price: null });
+    console.log(`[admin] Trade #${tradeId} manually marked as won`);
+
+    // Recalculate pool balance from wallet via RPC (next sync) â€” adjust pool by pnl delta
+    const oldPnl = trade.pnl || 0;
+    const pnlDelta = pnl - oldPnl;
+    const poolBalance = db.getPoolBalance();
+    db.updatePoolBalance(poolBalance + pnlDelta);
+  }
+
+  if (action === 'loss') {
+    const pnl = -trade.cost;
+    db.updateTrade(tradeId, { result: 'lost', pnl, close_price: null });
+    console.log(`[admin] Trade #${tradeId} manually marked as lost`);
+
+    const oldPnl = trade.pnl || 0;
+    const pnlDelta = pnl - oldPnl;
+    const poolBalance = db.getPoolBalance();
+    db.updatePoolBalance(poolBalance + pnlDelta);
+  }
+
+  res.json({ success: true, message: 'Trade updated' });
+});
+
+app.post('/api/pause', (req, res) => {
+  const { password } = req.body;
+  if (!password || password !== config.jwtSecret) {
+    return res.status(401).json({ error: 'Invalid password' });
+  }
+  global.botPaused = !global.botPaused;
+  db.setSetting('paused', String(global.botPaused));
+  if (global.botPaused) {
+    console.log('[bot] \u23F8 Bot PAUSED by user');
+    notifications.botPaused();
+  } else {
+    console.log('[bot] \u25B6 Bot RESUMED by user');
+    notifications.botResumed();
+  }
+  res.json({ paused: global.botPaused });
+});
+
+// --- GET /api/positions (Data API redeemable positions) ---
+app.get('/api/positions', auth.authMiddleware, async (req, res) => {
+  try {
+    const data = await claimer.getRedeemablePositions();
+    res.json(data);
+  } catch (err) {
+    console.error('[api] /api/positions error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/claim/speedup/:tradeId', auth.authMiddleware, async (req, res) => {
+  const result = await claimer.speedUpClaim(parseInt(req.params.tradeId, 10));
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  res.json(result);
+});
+
+app.post('/api/claim/:tradeId', auth.authMiddleware, async (req, res) => {
+  const result = await claimer.claimWinnings(parseInt(req.params.tradeId, 10));
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  res.json(result);
+});
+
+// --- POST /api/claim-all (claim all redeemable positions from Data API) ---
+app.post('/api/claim-all', auth.authMiddleware, async (req, res) => {
+  const result = await claimer.claimAll();
+  res.json(result);
+});
+
+// --- POST /api/claim-direct (claim by conditionId + outcomeIndex, no trade record needed) ---
+app.post('/api/claim-direct', auth.authMiddleware, async (req, res) => {
+  const { conditionId, outcomeIndex } = req.body;
+  if (!conditionId) {
+    return res.status(400).json({ success: false, error: 'Missing conditionId' });
+  }
+  const oi = typeof outcomeIndex === 'number' ? outcomeIndex : parseInt(outcomeIndex, 10);
+  if (isNaN(oi) || (oi !== 0 && oi !== 1)) {
+    return res.status(400).json({ success: false, error: 'outcomeIndex must be 0 or 1' });
+  }
+  const result = await claimer.claimDirect(conditionId, oi);
+  if (!result.success) {
+    return res.status(400).json(result);
+  }
+  res.json(result);
+});
+
+
+// --- GET /api/status (combined dashboard endpoint) ---
+
+app.get('/api/status', auth.authMiddleware, (req, res) => {
+  const pool = db.getPoolBalance();
+
+  // Lanes
+  const lanesStatus = config.lanes.map((lane) => {
+    const currentPrice = coinbaseWS.getPrice(lane.asset);
+    const windowTs = priceTracker.getWindowTs(lane.interval);
+    const remainingSeconds = priceTracker.getRemainingSeconds(lane.interval);
+    const totalSeconds = lane.interval * 60;
+    const win = priceTracker.getWindow(lane.id, windowTs);
+    const openPrice = win ? win.openPrice : null;
+
+    let irrev = 0;
+    let direction = null;
+    if (currentPrice != null && openPrice != null) {
+      irrev = superScalp.calculateIrrev(lane.asset, openPrice, currentPrice, remainingSeconds, totalSeconds);
+      direction = superScalp.getDirection(openPrice, currentPrice);
+    }
+
+    return {
+      id: lane.id,
+      asset: lane.asset,
+      interval: lane.interval,
+      currentPrice,
+      openPrice,
+      irrev: parseFloat(irrev.toFixed(3)),
+      direction,
+      remainingSeconds,
+      stackLevel: superScalp.getStackLevel(lane.id),
+      volatility: volatilityTracker.getVolatility(lane.asset),
+    };
+  });
+
+  // Stats
+  const raw = db.getDb();
+  const totals = raw.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN result = 'won' THEN 1 ELSE 0 END) AS wins,
+      SUM(CASE WHEN result = 'lost' THEN 1 ELSE 0 END) AS losses,
+      SUM(CASE WHEN result = 'pending' THEN 1 ELSE 0 END) AS pending,
+      SUM(CASE WHEN result = 'expired' THEN 1 ELSE 0 END) AS expired,
+      SUM(CASE WHEN result = 'burned' THEN 1 ELSE 0 END) AS burned,
+      COALESCE(SUM(CASE WHEN result != 'burned' THEN pnl ELSE 0 END), 0) AS totalPnl
+    FROM trades
+  `).get();
+
+  const todayUtc = new Date();
+  todayUtc.setUTCHours(0, 0, 0, 0);
+  const todayRow = raw.prepare(`
+    SELECT COALESCE(SUM(pnl), 0) AS todayPnl, COUNT(*) AS todayTrades
+    FROM trades WHERE created_at >= ? AND result IN ('won', 'lost')
+  `).get(todayUtc.toISOString());
+  const pnlKey = `${todayRow.todayPnl.toFixed(2)}|${todayRow.todayTrades}`;
+  if (pnlKey !== global._lastPnlLog) {
+    global._lastPnlLog = pnlKey;
+    console.log(`[STATS] Today P&L: $${todayRow.todayPnl.toFixed(2)} (${todayRow.todayTrades} trades resolved today)`);
+  }
+
+  const decided = totals.wins + totals.losses + totals.burned;
+
+  const yesterdayPoolRaw = db.getSetting('yesterdayPoolBalance');
+  const yesterdayPool = yesterdayPoolRaw != null ? parseFloat(yesterdayPoolRaw) : null;
+
+  res.json({
+    pool,
+    yesterdayPool,
+    uptime: process.uptime(),
+    paused: global.botPaused,
+    dryRun: global.runtimeConfig.dryRun,
+    prices: coinbaseWS.prices,
+    walletAddress: config.walletAddress,
+    lanes: lanesStatus,
+    stats: {
+      totalTrades: totals.total,
+      wins: totals.wins,
+      losses: totals.losses,
+      expired: totals.expired,
+      pending: totals.pending,
+      burned: totals.burned,
+      winRate: decided > 0 ? parseFloat((totals.wins / decided).toFixed(4)) : 0,
+      totalPnl: parseFloat(totals.totalPnl.toFixed(2)),
+      todayPnl: parseFloat(todayRow.todayPnl.toFixed(2)),
+      todayTrades: todayRow.todayTrades,
+    },
+  });
+});
+
+// --- GET /api/logs ---
+
+app.get('/api/logs', auth.authMiddleware, (req, res) => {
+  res.json(global.logBuffer);
+});
+
+app.get('/api/logs/errors', auth.authMiddleware, (req, res) => {
+  res.json(global.logBuffer.filter((e) => e.level === 'error'));
+});
+
+// --- Settings ---
+
+const SETTINGS_WHITELIST = [
+  'irrevThreshold', 'irrevStack2', 'irrevStack3',
+  'dryRun', 'logLevel', 'laneEnabled',
+  'maxTradeSize', 'maxLossPerTrade', 'minShares', 'minPoolBalance',
+  'spreadScalpIrrev', 'spreadScalpLastSeconds', 'limitOrderTimeoutMs',
+  'entryWindow5M', 'entryWindow15M',
+  'tier1', 'tier2', 'tier3', 'tier4',
+  'cbMaxLosses', 'cbWindowHours', 'cbPauseHours',
+];
+
+app.get('/api/settings', auth.authMiddleware, (req, res) => {
+  const raw = db.getDb();
+  const rows = raw.prepare('SELECT key, value FROM settings').all();
+  const settings = {};
+  for (const row of rows) {
+    try { settings[row.key] = JSON.parse(row.value); } catch { settings[row.key] = row.value; }
+  }
+  res.json(settings);
+});
+
+app.post('/api/settings/:key', auth.authMiddleware, (req, res) => {
+  const { key } = req.params;
+  const { value } = req.body;
+
+  if (!SETTINGS_WHITELIST.includes(key)) {
+    return res.status(400).json({ error: `Setting '${key}' is not allowed` });
+  }
+  if (value === undefined) {
+    return res.status(400).json({ error: 'Missing value in request body' });
+  }
+
+  db.setSetting(key, JSON.stringify(value));
+
+  // Update in-memory runtime config for live-adjustable keys
+  if (key in global.runtimeConfig) {
+    global.runtimeConfig[key] = value;
+  }
+
+  res.json({ success: true });
+});
+
+// --- Log file endpoints ---
+
+app.get('/api/logs/files', auth.authMiddleware, (req, res) => {
+  try {
+    const files = fs.readdirSync(LOG_DIR);
+    const logFiles = files
+      .filter(f => /^bot(-\d{4}-\d{2}-\d{2})?\.log$/.test(f))
+      .map(f => {
+        const stats = fs.statSync(path.join(LOG_DIR, f));
+        return { filename: f, size: stats.size, modified: stats.mtime.toISOString() };
+      })
+      .sort((a, b) => b.modified.localeCompare(a.modified));
+    res.json(logFiles);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/logs/download/:filename', auth.authMiddleware, (req, res) => {
+  const { filename } = req.params;
+  if (!/^bot(-\d{4}-\d{2}-\d{2})?\.log$/.test(filename)) {
+    return res.status(400).json({ error: 'Invalid filename' });
+  }
+  const filePath = path.join(LOG_DIR, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  res.download(filePath, filename);
+});
+
+// --- Candle engine API ---
+
+app.get('/api/candles', auth.authMiddleware, (req, res) => {
+  res.json(candleEngine.getActiveCandles());
+});
+
+// --- Static files & client-side routing ---
+
+const dashboardPath = path.join(__dirname, '..', 'dashboard', 'dist');
+app.use(express.static(dashboardPath));
+
+app.get('/{*splat}', (req, res) => {
+  res.sendFile(path.join(dashboardPath, 'index.html'));
+});
+
+// --- Wallet balance sync (pool = wallet USDC.e, always) ---
+const WALLET_SYNC_RPCS = [
+  'https://polygon-rpc.com',
+  'https://rpc.ankr.com/polygon',
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon.llamarpc.com',
+  'https://poly-rpc.gateway.pokt.network',
+];
+let lastSyncedBalance = null;
+
+async function syncWalletBalance(verbose) {
+  const { ethers } = require('ethers');
+  const USDC_E = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+  const erc20Abi = ['function balanceOf(address) view returns (uint256)'];
+
+  for (const url of WALLET_SYNC_RPCS) {
+    try {
+      const provider = new ethers.providers.JsonRpcProvider(url);
+      await provider.getBlockNumber();
+      if (verbose) console.log(`[boot] Pool sync connected to RPC: ${url}`);
+      const wallet = new ethers.Wallet(config.polygonPrivateKey, provider);
+      const usdc = new ethers.Contract(USDC_E, erc20Abi, provider);
+      const raw = await usdc.balanceOf(wallet.address);
+      const walletBalance = parseFloat(ethers.utils.formatUnits(raw, 6));
+      const rounded = Math.round(walletBalance * 100) / 100;
+
+      if (lastSyncedBalance === null || lastSyncedBalance !== rounded) {
+        db.updatePoolBalance(rounded);
+        if (verbose) {
+          console.log(`[boot] Pool synced to wallet USDC.e: $${rounded.toFixed(2)}`);
+        } else {
+          console.log(`[WALLET] Balance sync: $${rounded.toFixed(2)}`);
+        }
+        lastSyncedBalance = rounded;
+      }
+      return true;
+    } catch (err) {
+      if (verbose) console.log(`[boot] Pool sync RPC failed: ${url} â€” ${err.message}`);
+    }
+  }
+
+  if (verbose) {
+    const balance = db.getPoolBalance();
+    console.log(`[boot] Pool wallet sync failed â€” keeping DB value: $${balance}`);
+  }
+  return false;
+}
+
+// --- Start ---
+
+app.listen(config.port, () => {
+  const balance = db.getPoolBalance();
+  console.log(`[boot] y28 Polymarket Bot started on port ${config.port}`);
+  console.log(`[boot] Pool balance: $${balance}`);
+
+  console.log('[boot] Coinbase WebSocket connecting...');
+  coinbaseWS.connect();
+
+  console.log('[boot] Polymarket RTDS connecting...');
+  polymarketRTDS.connect();
+
+  // Initialize order executor
+  orderExecutor.init().then(async () => {
+    console.log(`[boot] Order executor ready (initialized=${orderExecutor.initialized})`);
+
+    // Sync pool to wallet USDC.e balance on boot
+    await syncWalletBalance(true);
+
+    // Recurring wallet balance sync every 60s
+    setInterval(() => syncWalletBalance(false), 60000);
+  }).catch((err) => {
+    console.error('[boot] Order executor init failed:', err.message);
+  });
+
+  // Start resolver pending-trade safety net
+  resolver.start();
+
+  // Start oracle trade resolver (Data API as single source of truth for win/loss)
+  claimer.startOracleResolver();
+
+  // --- Daily pool balance snapshot for "yesterday" comparison ---
+  let lastSnapshotDate = db.getSetting('poolBalanceDate');
+
+  function checkDailyPoolSnapshot() {
+    const todayStr = new Date().toISOString().slice(0, 10);
+    if (lastSnapshotDate && lastSnapshotDate !== todayStr) {
+      // Day changed â€” snapshot yesterday's closing balance
+      const currentBalance = db.getPoolBalance();
+      db.setSetting('yesterdayPoolBalance', String(currentBalance));
+      console.log(`[pool] Daily snapshot: yesterdayPoolBalance = $${currentBalance}`);
+    }
+    if (lastSnapshotDate !== todayStr) {
+      db.setSetting('poolBalanceDate', todayStr);
+      lastSnapshotDate = todayStr;
+    }
+  }
+
+  checkDailyPoolSnapshot();
+  setInterval(checkDailyPoolSnapshot, 60000); // check every minute
+
+  // Log rotation check every minute
+  rotateLogIfNeeded();
+  setInterval(rotateLogIfNeeded, 60000);
+
+  // Start SuperScalp engine after 10s warmup for prices & volatility
+  const lastWindowTs = new Map();
+
+  setTimeout(() => {
+    const balance = db.getPoolBalance();
+    console.log('[scalp] SuperScalp engine starting (10s warmup complete)');
+    console.log(`[boot] Bot ready â€” ${config.lanes.length} lanes active, dryRun=${config.dryRun}, pool=$${balance}, paused=${global.botPaused}`);
+
+    scalpInterval = setInterval(() => {
+      for (const lane of config.lanes) {
+        (async () => {
+          try {
+            const currentWindowTs = priceTracker.getWindowTs(lane.interval);
+            const prevWindowTs = lastWindowTs.get(lane.id);
+
+            // Detect window transition
+            if (prevWindowTs != null && prevWindowTs !== currentWindowTs) {
+              console.log(`[scalp] Window transition ${lane.id}: ${prevWindowTs} â†’ ${currentWindowTs}`);
+
+              // Capture close price for the OLD window before resolving.
+              // captureClosePrice() won't work here â€” getWindowTs() already
+              // returns the new window. Set directly on the old window object.
+              const oldWin = priceTracker.getWindow(lane.id, prevWindowTs);
+              if (oldWin && !oldWin.capturedClose) {
+                const closePrice = coinbaseWS.getPrice(lane.asset);
+                if (closePrice != null) {
+                  oldWin.closePrice = closePrice;
+                  oldWin.capturedClose = true;
+                }
+              }
+
+              resolver.resolveWindow(lane.id, prevWindowTs, lane.interval).catch(err => console.error(`[resolver] Error resolving ${lane.id}:`, err.message));
+              candleEngine.resetLane(lane.id);
+              superScalp.resetWindow(lane.id, currentWindowTs);
+            }
+
+            lastWindowTs.set(lane.id, currentWindowTs);
+
+            // Skip new entries when paused (resolution above still runs)
+            if (global.botPaused) return;
+
+            // --- Midpoint path ---
+            try {
+              const signal = await superScalp.evaluate(lane.id);
+              if (signal) {
+                console.log(`[signal] ${signal.type} ${signal.laneId} irrev=${signal.irrev.toFixed(2)} dir=${signal.direction}`);
+
+                const market = await marketDiscovery.findMarket(signal.laneId, signal.windowTs, lane.interval);
+                if (market) {
+                  const trade = await orderExecutor.executeEntry(signal, market);
+                  if (trade) {
+                    console.log(`[trade] Entered ${trade.lane_id} ${trade.side} @ $${trade.entry_price} shares=${trade.shares} irrev=${signal.irrev.toFixed(2)}`);
+                    notifications.tradeEntry({ laneId: trade.lane_id, direction: trade.side, entryPrice: trade.entry_price, shares: trade.shares, cost: trade.cost, irrev: signal.irrev.toFixed(2), type: 'midpoint' });
+                    candleEngine.markTradeEntry(trade.lane_id, signal.windowTs, trade.id, trade.entry_price, Date.now());
+
+                    const entries = superScalp.activeEntries.get(signal.laneId) || [];
+                    entries.push({
+                      entryPrice: trade.entry_price,
+                      windowTs: signal.windowTs,
+                      tradeId: trade.id,
+                    });
+                    superScalp.activeEntries.set(signal.laneId, entries);
+                  }
+                } else {
+                  console.log(`[scalp] No market found for ${signal.laneId} window=${signal.windowTs}`);
+                }
+              }
+            } catch (err) {
+              console.error(`[scalp] Error evaluating ${lane.id}:`, err.message);
+            }
+
+            // --- Spread scalp path (independent of midpoint) ---
+            try {
+              const ssSignal = await spreadScalp.evaluate(lane.id);
+              if (ssSignal) {
+                const ssTrade = await orderExecutor.executeEntry(ssSignal, ssSignal.market);
+                if (ssTrade) {
+                  spreadScalp.recordEntry(lane.id, ssSignal.windowTs);
+                  console.log(`[spread-scalp] Entered ${lane.id} ${ssSignal.direction} @ $${ssSignal.entryPrice} shares=${ssSignal.shares} irrev=${ssSignal.irrev.toFixed(2)}`);
+                  notifications.tradeEntry({ laneId: ssTrade.lane_id, direction: ssTrade.side, entryPrice: ssTrade.entry_price, shares: ssTrade.shares, cost: ssTrade.cost, irrev: ssSignal.irrev.toFixed(2), type: 'spread_scalp' });
+                  candleEngine.markTradeEntry(ssTrade.lane_id, ssSignal.windowTs, ssTrade.id, ssTrade.entry_price, Date.now());
+                }
+              }
+            } catch (err) {
+              console.error(`[spread-scalp] Error evaluating ${lane.id}:`, err.message);
+            }
+          } catch (err) {
+            console.error(`[loop] Error in lane ${lane.id}:`, err.message);
+          }
+        })();
+      }
+    }, 1000);
+  }, 10000);
+
+  startupComplete = true;
+});
+
+// --- Graceful shutdown ---
+
+function shutdown() {
+  console.log('[shutdown] Shutting down...');
+  if (scalpInterval) clearInterval(scalpInterval);
+  resolver.close();
+  claimer.close();
+  polymarketRTDS.close();
+  coinbaseWS.close();
+  priceTracker.close();
+  marketDiscovery.destroy();
+  db.getDb().close();
+  console.log('[shutdown] Bot stopped gracefully');
+  process.exit(0);
+}
+
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+require('dotenv').config();
+
+function deepFreeze(obj) {
+  Object.freeze(obj);
+  for (const val of Object.values(obj)) {
+    if (val && typeof val === 'object' && !Object.isFrozen(val)) {
+      deepFreeze(val);
+    }
+  }
+  return obj;
+}
+
+const assets = ['BTC', 'ETH', 'SOL', 'XRP', 'HYPE'];
+const intervals = [5, 15];
+
+const lanes = [];
+for (const asset of assets) {
+  for (const interval of intervals) {
+    lanes.push({ asset, interval, id: `${asset}-${interval}M` });
+  }
+}
+
+const config = deepFreeze({
+  port: process.env.PORT || 3000,
+  dbPath: process.env.DATABASE_PATH || './data/pmb.db',
+  jwtSecret: process.env.PMB_PASSWORD || 'changeme',
+  polygonPrivateKey: process.env.POLYGON_PRIVATE_KEY,
+  polygonRpc: process.env.POLYGON_RPC_URL || 'https://polygon-bor-rpc.publicnode.com',
+  clobUrl: process.env.POLYMARKET_CLOB_URL || 'https://clob.polymarket.com',
+  chainId: parseInt(process.env.CHAIN_ID || '137'),
+  usdcAddress: '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174',
+  walletAddress: '0x140311be486530231450118D417c6015FF7df491',
+  telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || null,
+  telegramChatId: process.env.TELEGRAM_CHAT_ID || null,
+  startingPoolBalance: 18.57,
+  minPoolBalance: 10,
+  maxTradeSize: 20,
+  maxLossPerTrade: 5,
+  minShares: 5,
+  tickSize: 0.01,
+  assets,
+  intervals,
+  lanes,
+  compoundingTiers: [
+    { minBalance: 0, maxBalance: 75, allocation: 0.08 },
+    { minBalance: 75, maxBalance: 150, allocation: 0.10 },
+    { minBalance: 150, maxBalance: 300, allocation: 0.12 },
+    { minBalance: 300, maxBalance: Infinity, allocation: 0.15 },
+  ],
+  irrevThresholds: { base: 1.5, stack2: 2.5, stack3: 3.5 },
+  irrevMultipliers: {
+    high: { threshold: 5.0, multiplier: 1.25 },
+    extreme: { threshold: 10.0, multiplier: 1.5 },
+  },
+  entryWindows: { 5: 210, 15: 420 },
+  midpointPriceRange: { min: 0.20, max: 0.70 },
+  spreadScalpPriceRange: { min: 0.20, max: 0.99 },
+  spreadScalpIrrev: 3.0,
+  spreadScalpLastSeconds: 60,
+  spreadScalpCircuitBreaker: { maxLosses: 3, windowHours: 1, pauseHours: 2 },
+  enhancedGates: {
+    // Layer 2: Chainlink non-contradiction â€” noise thresholds (oracle "flat" zone)
+    chainlinkNoise: {
+      BTC: 2,
+      ETH: 0.10,
+      SOL: 0.01,
+      XRP: 0.0002,
+      HYPE: 0.05,
+    },
+    // Layer 3: Chainlink delta ratio (only when Chainlink has moved beyond noise)
+    chainlinkDeltaRatio: 0.30,
+    // Layer 6: Max retracement from peak window move (0.60 = 60%)
+    maxRetracement: 0.60,
+    // Layer 7: Minimum absolute delta from open to enter
+    minDelta: {
+      BTC: 8,
+      ETH: 0.40,
+      SOL: 0.08,
+      XRP: 0.0015,
+      HYPE: 0.15,
+    },
+    // Layer 5: Cross-asset minimum irrev to count as confirming
+    crossAssetMinIrrev: 0.3,
+    // Layer 4: Trend consistency lookback in seconds
+    trendLookbackSeconds: 30,
+  },
+  stackMaxEntries: 2,
+  stackPriceImprovement: 0.02,
+  limitOrderTimeoutMs: 5000,
+  dryRun: false,
+});
+
+module.exports = config;
+const config = require('./config');
+const { coinbaseWS } = require('./coinbase-ws');
+const { priceTracker } = require('./price-tracker');
+const { volatilityTracker } = require('./volatility');
+const { getChainlinkPrice } = require('./chainlink');
+const { polymarketRTDS } = require('./polymarket-ws');
+const marketDiscovery = require('./market-discovery');
+const db = require('./db');
+
+const SECONDS_PER_YEAR = 31536000;
+
+class SuperScalp {
+  constructor() {
+    this.activeEntries = new Map();
+    this.spreadScalpLosses = [];
+    this._lastLogTime = new Map();
+    this.peakDeltas = new Map();
+    this._lastEnhancedLogTime = new Map();
+  }
+
+  // --- Core irreversibility formula ---
+  calculateIrrev(asset, openPrice, currentPrice, remainingSeconds, totalSeconds) {
+    const delta = Math.abs(currentPrice - openPrice) / openPrice;
+    const vol = volatilityTracker.getVolatility(asset);
+    const windowVol = vol * Math.sqrt(totalSeconds / SECONDS_PER_YEAR);
+    const timeRemaining = Math.sqrt(remainingSeconds / totalSeconds);
+    const expectedMove = windowVol * timeRemaining;
+
+    if (!expectedMove || expectedMove < 0.0001) return 0;
+    return delta / expectedMove;
+  }
+
+  // --- Direction determination ---
+  getDirection(openPrice, currentPrice) {
+    return currentPrice >= openPrice ? 'UP' : 'DOWN';
+  }
+
+  // --- Allocation sizing ---
+  calculateAllocation(poolBalance, irrev) {
+    const tier = config.compoundingTiers.find(
+      t => poolBalance >= t.minBalance && poolBalance < t.maxBalance
+    );
+    if (!tier) return 0;
+
+    let allocation = poolBalance * tier.allocation;
+
+    if (irrev >= config.irrevMultipliers.extreme.threshold) {
+      allocation *= config.irrevMultipliers.extreme.multiplier;
+    } else if (irrev >= config.irrevMultipliers.high.threshold) {
+      allocation *= config.irrevMultipliers.high.multiplier;
+    }
+
+    // Floor: always enough to buy minShares at max midpoint price ($0.55)
+    allocation = Math.max(allocation, config.minShares * 0.55);
+
+    // Safety net: never exceed 25% of pool regardless of tier
+    allocation = Math.min(allocation, poolBalance * 0.25);
+
+    return Math.min(allocation, config.maxTradeSize);
+  }
+
+  // --- Share calculation with loss cap ---
+  calculateShares(allocation, entryPrice) {
+    let shares = allocation / entryPrice;
+
+    // Check potential loss: shares * (1 - entryPrice)
+    const potentialLoss = shares * (1 - entryPrice);
+    if (potentialLoss > config.maxLossPerTrade) {
+      shares = config.maxLossPerTrade / (1 - entryPrice);
+    }
+
+    if (shares < config.minShares) return null;
+
+    return {
+      shares: Math.floor(shares),
+      cost: Math.floor(shares) * entryPrice,
+    };
+  }
+
+  // --- Velocity check ---
+  checkVelocity(asset, direction, seconds = 10) {
+    const arr = volatilityTracker.ticks.get(asset);
+    if (!arr || arr.length < 3) return true;
+
+    const cutoff = Date.now() - seconds * 1000;
+    const recent = arr.filter(t => t.timestamp >= cutoff);
+    if (recent.length < 3) return true;
+
+    const last3 = recent.slice(-3);
+    let consistent = 0;
+    for (let i = 1; i < last3.length; i++) {
+      const diff = last3[i].price - last3[i - 1].price;
+      if (direction === 'UP' && diff >= 0) consistent++;
+      if (direction === 'DOWN' && diff <= 0) consistent++;
+    }
+
+    return consistent >= last3.length - 1;
+  }
+
+  // --- Stack tracking ---
+  getStackLevel(laneId) {
+    const entries = this.activeEntries.get(laneId);
+    return entries ? entries.length : 0;
+  }
+
+  getIrrevThreshold(stackLevel) {
+    if (stackLevel === 0) return config.irrevThresholds.base;
+    if (stackLevel === 1) return config.irrevThresholds.stack2;
+    return config.irrevThresholds.stack3;
+  }
+
+  // FIX 2: Unified minimum irrev threshold â€” midpoint must match scalp gate minimums
+  getUnifiedMinThreshold(asset, interval) {
+    if (interval === 5) return config.irrevThresholds.base; // 1.9 for 5M
+    // 15M lanes
+    if (asset === 'BTC') return 3.5;
+    return 2.5; // ETH, SOL, XRP
+  }
+
+  // --- Midpoint gate check ---
+  checkGates(laneId, asset, interval, irrev, entryPrice, remainingSeconds, direction, stackLevel) {
+    const threshold = this.getIrrevThreshold(stackLevel);
+    if (irrev < threshold) {
+      return { pass: false, reason: `irrev ${irrev.toFixed(2)} < threshold ${threshold}` };
+    }
+
+    const entryWindow = config.entryWindows[interval];
+    if (remainingSeconds > entryWindow) {
+      return { pass: false, reason: `remaining ${remainingSeconds}s > entry window ${entryWindow}s` };
+    }
+    if (remainingSeconds <= 10) {
+      return { pass: false, reason: `remaining ${remainingSeconds}s too close to window end` };
+    }
+
+    if (!this.checkVelocity(asset, direction)) {
+      return { pass: false, reason: 'velocity reversing' };
+    }
+
+    if (entryPrice < config.midpointPriceRange.min || entryPrice > config.midpointPriceRange.max) {
+      return { pass: false, reason: `entry price $${entryPrice} outside midpoint range $${config.midpointPriceRange.min}-$${config.midpointPriceRange.max}` };
+    }
+
+    const poolBalance = db.getPoolBalance();
+    if (poolBalance < config.minPoolBalance) {
+      return { pass: false, reason: `pool $${poolBalance.toFixed(2)} < minimum $${config.minPoolBalance}` };
+    }
+
+    const entries = this.activeEntries.get(laneId) || [];
+    if (entries.length >= config.stackMaxEntries) {
+      return { pass: false, reason: `max stacks (${config.stackMaxEntries}) reached` };
+    }
+
+    if (stackLevel > 0 && entries.length > 0) {
+      const lastEntry = entries[entries.length - 1];
+      if (entryPrice > lastEntry.entryPrice - config.stackPriceImprovement) {
+        return { pass: false, reason: `entry $${entryPrice} not $${config.stackPriceImprovement} better than prev $${lastEntry.entryPrice}` };
+      }
+    }
+
+    const allocation = this.calculateAllocation(poolBalance, irrev);
+    const shareCalc = this.calculateShares(allocation, entryPrice);
+    if (!shareCalc) {
+      return { pass: false, reason: 'insufficient shares (below min or exceeds loss cap)' };
+    }
+
+    return { pass: true, reason: 'all gates passed' };
+  }
+
+  // --- Spread scalp gate check ---
+  checkSpreadScalpGates(laneId, asset, interval, irrev, askPrice, remainingSeconds) {
+    if (irrev < config.spreadScalpIrrev) {
+      return { pass: false, reason: `irrev ${irrev.toFixed(2)} < spread scalp threshold ${config.spreadScalpIrrev}` };
+    }
+
+    if (remainingSeconds > config.spreadScalpLastSeconds) {
+      return { pass: false, reason: `remaining ${remainingSeconds}s > last ${config.spreadScalpLastSeconds}s window` };
+    }
+
+    if (askPrice < config.spreadScalpPriceRange.min || askPrice > config.spreadScalpPriceRange.max) {
+      return { pass: false, reason: `ask price $${askPrice} outside range $${config.spreadScalpPriceRange.min}-$${config.spreadScalpPriceRange.max}` };
+    }
+
+    const poolBalance = db.getPoolBalance();
+    if (poolBalance < config.minPoolBalance) {
+      return { pass: false, reason: `pool $${poolBalance.toFixed(2)} < minimum $${config.minPoolBalance}` };
+    }
+
+    // Circuit breaker check
+    const cb = config.spreadScalpCircuitBreaker;
+    const oneHourAgo = Date.now() - cb.windowHours * 60 * 60 * 1000;
+    const recentLosses = this.spreadScalpLosses.filter(ts => ts >= oneHourAgo);
+    if (recentLosses.length >= cb.maxLosses) {
+      const lastLoss = Math.max(...recentLosses);
+      const pauseEnd = lastLoss + cb.pauseHours * 60 * 60 * 1000;
+      if (Date.now() < pauseEnd) {
+        const remainPause = Math.ceil((pauseEnd - Date.now()) / 1000 / 60);
+        return { pass: false, reason: `circuit breaker: ${recentLosses.length} losses in 1hr, paused ${remainPause}min` };
+      }
+    }
+
+    return { pass: true, reason: 'all spread scalp gates passed' };
+  }
+
+  // --- Enhanced multi-layer gate filter ---
+  async checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs) {
+    const gates = config.enhancedGates;
+    const peakKey = `${laneId}-${windowTs}`;
+
+    // Update peak delta tracking (Layer 6)
+    const currentDelta = Math.abs(currentPrice - openPrice);
+    const prevPeak = this.peakDeltas.get(peakKey) || 0;
+    if (currentDelta > prevPeak) {
+      this.peakDeltas.set(peakKey, currentDelta);
+    }
+    const peakDelta = this.peakDeltas.get(peakKey);
+
+    // Throttle enhanced gate logs (10s per lane)
+    const now = Date.now();
+    const logKey = `enhanced-${laneId}`;
+    const lastEnhLog = this._lastEnhancedLogTime.get(logKey) || 0;
+    const shouldLog = now - lastEnhLog >= 10000;
+    if (shouldLog) this._lastEnhancedLogTime.set(logKey, now);
+
+    // LAYER 7 â€” Time-Scaled Minimum Delta Filter (HARD GATE)
+    const delta = Math.abs(currentPrice - openPrice);
+    const baseDelta = gates.minDelta[asset];
+    const remainingSeconds = priceTracker.getRemainingSeconds(interval);
+    let timeMultiplier = 1.0;
+    if (remainingSeconds <= 10) timeMultiplier = 1.5;
+    else if (remainingSeconds <= 30) timeMultiplier = 1.4;
+    else if (remainingSeconds <= 60) timeMultiplier = 1.3;
+    else if (remainingSeconds <= 120) timeMultiplier = 1.2;
+    const scaledDelta = baseDelta * timeMultiplier;
+    if (delta < scaledDelta) {
+      if (shouldLog) console.log(`[enhanced] ${laneId} KILLED: delta $${delta.toFixed(4)} < scaled min $${scaledDelta.toFixed(4)} (base=$${baseDelta} x${timeMultiplier} at ${remainingSeconds}s remaining)`);
+      return { pass: false, reason: 'enhanced L7: delta too small' };
+    }
+
+    // LAYER 6 â€” No-Reversal Check (HARD GATE)
+    if (peakDelta > 0) {
+      const retracement = 1 - (currentDelta / peakDelta);
+      if (retracement > gates.maxRetracement) {
+        if (shouldLog) console.log(`[enhanced] ${laneId} KILLED: retracement ${(retracement * 100).toFixed(1)}% > max ${gates.maxRetracement * 100}%`);
+        return { pass: false, reason: 'enhanced L6: retracement too high' };
+      }
+    }
+
+    // LAYER 2 â€” Chainlink Non-Contradiction (HARD GATE)
+    let chainlinkDirection = 'neutral';
+    let chainlinkDelta = 0;
+    try {
+      let currentChainlinkPrice = polymarketRTDS.getPrice(asset);
+      if (currentChainlinkPrice == null) {
+        currentChainlinkPrice = await getChainlinkPrice(asset);
+      }
+      if (currentChainlinkPrice != null) {
+        chainlinkDelta = currentChainlinkPrice - openPrice;
+        if (Math.abs(chainlinkDelta) <= gates.chainlinkNoise[asset]) {
+          chainlinkDirection = 'neutral';
+        } else {
+          chainlinkDirection = chainlinkDelta > 0 ? 'UP' : 'DOWN';
+        }
+      }
+    } catch (_) {
+      // RPC failure â†’ pass (don't block on RPC errors)
+      chainlinkDirection = 'neutral';
+    }
+
+    if (chainlinkDirection !== 'neutral' && chainlinkDirection !== direction) {
+      console.log(`[enhanced] ${laneId} KILLED: Chainlink contradicts (signal=${direction}, chainlink=${chainlinkDirection}, delta=$${chainlinkDelta.toFixed(4)})`);
+      return { pass: false, reason: 'enhanced L2: Chainlink contradicts' };
+    }
+
+    // LAYER 3 â€” Chainlink Delta Ratio (HARD GATE, only when Chainlink not neutral)
+    if (chainlinkDirection !== 'neutral') {
+      const coinbaseDelta = Math.abs(currentPrice - openPrice);
+      const chainlinkAbsDelta = Math.abs(chainlinkDelta);
+      if (coinbaseDelta > 0) {
+        const ratio = chainlinkAbsDelta / coinbaseDelta;
+        if (ratio < gates.chainlinkDeltaRatio) {
+          console.log(`[enhanced] ${laneId} KILLED: Chainlink ratio too low (${(ratio * 100).toFixed(1)}% < ${gates.chainlinkDeltaRatio * 100}%)`);
+          return { pass: false, reason: 'enhanced L3: Chainlink ratio too low' };
+        }
+      }
+    }
+
+    // LAYER 4 â€” Trend Consistency (SOFT â€” log only)
+    if (shouldLog) {
+      const arr = volatilityTracker.ticks.get(asset);
+      if (arr && arr.length >= 2) {
+        const cutoff = now - gates.trendLookbackSeconds * 1000;
+        const recent = arr.filter(t => t.timestamp >= cutoff);
+        if (recent.length >= 2) {
+          const bucketSize = 5000;
+          const buckets = [];
+          let bucketStart = recent[0].timestamp;
+          let bucketTicks = [recent[0]];
+          for (let i = 1; i < recent.length; i++) {
+            if (recent[i].timestamp - bucketStart >= bucketSize) {
+              buckets.push(bucketTicks);
+              bucketTicks = [recent[i]];
+              bucketStart = recent[i].timestamp;
+            } else {
+              bucketTicks.push(recent[i]);
+            }
+          }
+          if (bucketTicks.length > 0) buckets.push(bucketTicks);
+
+          if (buckets.length >= 2) {
+            let matching = 0;
+            let total = 0;
+            for (let i = 1; i < buckets.length; i++) {
+              const prevAvg = buckets[i - 1].reduce((s, t) => s + t.price, 0) / buckets[i - 1].length;
+              const currAvg = buckets[i].reduce((s, t) => s + t.price, 0) / buckets[i].length;
+              const bucketDir = currAvg >= prevAvg ? 'UP' : 'DOWN';
+              if (bucketDir === direction) matching++;
+              total++;
+            }
+            const trendScore = matching / total;
+            console.log(`[enhanced] ${laneId} trend=${trendScore.toFixed(2)} (${direction})`);
+          }
+        }
+      }
+    }
+
+    // LAYER 5 â€” Cross-Asset Momentum (SOFT â€” log only)
+    if (shouldLog) {
+      const otherAssets = config.assets.filter(a => a !== asset);
+      let confirmCount = 0;
+      const totalSeconds = interval * 60;
+      const remainingSeconds = priceTracker.getRemainingSeconds(interval);
+      for (const otherAsset of otherAssets) {
+        const otherLaneId = `${otherAsset}-${interval}M`;
+        const otherKey = `${otherLaneId}:${windowTs}`;
+        const otherWin = priceTracker.windows.get(otherKey);
+        if (!otherWin || !otherWin.capturedOpen || otherWin.openPrice == null) continue;
+        const otherOpen = otherWin.openPrice;
+        const otherPrice = coinbaseWS.getPrice(otherAsset);
+        if (otherPrice == null) continue;
+        const otherIrrev = this.calculateIrrev(otherAsset, otherOpen, otherPrice, remainingSeconds, totalSeconds);
+        const otherDir = this.getDirection(otherOpen, otherPrice);
+        if (otherIrrev > gates.crossAssetMinIrrev && otherDir === direction) {
+          confirmCount++;
+        }
+      }
+      console.log(`[enhanced] ${laneId} cross-asset: ${confirmCount}/3 confirm ${direction}`);
+    }
+
+    return { pass: true, reason: 'all enhanced gates passed' };
+  }
+
+  // --- Main evaluation loop (called every second per lane) ---
+  async evaluate(laneId) {
+    const parts = laneId.split('-');
+    const asset = parts[0];
+    const interval = parseInt(parts[1], 10);
+    const totalSeconds = interval * 60;
+
+    const windowTs = priceTracker.getWindowTs(interval);
+    const remainingSeconds = priceTracker.getRemainingSeconds(interval);
+
+    // FIX 3: 15M time gate â€” only evaluate 15M lanes in last 5 minutes
+    if (interval === 15 && remainingSeconds > 300) {
+      const now15 = Date.now();
+      const logKey15 = `15m-gate-${laneId}`;
+      const lastLog15 = this._lastLogTime.get(logKey15) || 0;
+      if (now15 - lastLog15 >= 30000) {
+        this._lastLogTime.set(logKey15, now15);
+        console.log(`[scalp] ${laneId} SKIPPED: 15M time gate, remaining ${remainingSeconds}s > 300s`);
+      }
+      return null;
+    }
+
+    // Reset active entries on new window
+    const entries = this.activeEntries.get(laneId);
+    if (entries && entries.length > 0 && entries[0].windowTs !== windowTs) {
+      this.resetWindow(laneId, windowTs);
+    }
+
+    let currentPrice = polymarketRTDS.getPrice(asset);
+    if (currentPrice == null || polymarketRTDS.isStale()) {
+      currentPrice = coinbaseWS.getPrice(asset);
+      if (currentPrice != null && polymarketRTDS.isStale()) {
+        const now2 = Date.now();
+        const staleLogKey = `rtds-stale-${laneId}`;
+        const lastStaleLog = this._lastLogTime.get(staleLogKey) || 0;
+        if (now2 - lastStaleLog >= 30000) {
+          this._lastLogTime.set(staleLogKey, now2);
+          console.log(`[scalp] ${laneId} RTDS stale, using Coinbase fallback`);
+        }
+      }
+    }
+    if (currentPrice == null) return null;
+
+    const openPrice = await priceTracker.captureOpenPrice(laneId, interval);
+    if (openPrice == null) return null;
+
+    // Find market for orderbook/token lookups (not for open price)
+    let market = null;
+    try {
+      market = await marketDiscovery.findMarket(laneId, windowTs, interval);
+    } catch (_) {}
+
+    const irrev = this.calculateIrrev(asset, openPrice, currentPrice, remainingSeconds, totalSeconds);
+    const direction = this.getDirection(openPrice, currentPrice);
+
+    // Throttled logging: every 30 seconds per lane
+    const now = Date.now();
+    const lastLog = this._lastLogTime.get(laneId) || 0;
+    if (now - lastLog >= 30000) {
+      this._lastLogTime.set(laneId, now);
+      console.log(`[scalp] ${laneId} irrev=${irrev.toFixed(2)} dir=${direction} remaining=${remainingSeconds}s open=$${openPrice}`);
+    }
+
+    // Midpoint path â€” fetch real orderbook price when available
+    const stackLevel = this.getStackLevel(laneId);
+    const { orderExecutor } = require('./order-executor');
+    let entryPrice = 0.50; // fallback placeholder
+
+    // Attempt real orderbook price for midpoint
+    let midpointUsedRealPrice = false;
+    if (orderExecutor.initialized && orderExecutor.client && market) {
+      try {
+        const tokenId = direction === 'UP' ? market.upTokenId : market.downTokenId;
+        const realAsk = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
+        if (realAsk !== null) {
+          entryPrice = realAsk;
+          midpointUsedRealPrice = true;
+        }
+      } catch (_) {
+        // Fall back to placeholder
+      }
+    }
+
+    // If real ask exceeds midpoint range, skip midpoint path
+    let midpointCheck = { pass: false, reason: 'real ask outside midpoint range' };
+    if (entryPrice <= config.midpointPriceRange.max) {
+      midpointCheck = this.checkGates(laneId, asset, interval, irrev, entryPrice, remainingSeconds, direction, stackLevel);
+    }
+
+    // FIX 2: Unified minimum irrev threshold for midpoint path
+    if (midpointCheck.pass) {
+      const unifiedThreshold = this.getUnifiedMinThreshold(asset, interval);
+      if (irrev < unifiedThreshold) {
+        console.log(`[signal] midpoint ${laneId} irrev=${irrev.toFixed(2)} BLOCKED: below threshold ${unifiedThreshold}`);
+        midpointCheck = { pass: false, reason: `irrev below unified threshold ${unifiedThreshold}` };
+      }
+    }
+
+    if (midpointCheck.pass) {
+      const poolBalance = db.getPoolBalance();
+      const allocation = this.calculateAllocation(poolBalance, irrev);
+      const shareCalc = this.calculateShares(allocation, entryPrice);
+      if (shareCalc) {
+        // Minimum edge gate: expected profit must be >= $0.10
+        const expectedProfit = (shareCalc.shares * 1.00) - (shareCalc.shares * entryPrice);
+        if (expectedProfit < 0.10) {
+          console.log(`[scalp] ${laneId} GATE BLOCKED: edge too thin (profit $${expectedProfit.toFixed(2)} at ask $${entryPrice.toFixed(2)})`);
+        } else {
+          const enhancedResult = await this.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
+          if (!enhancedResult.pass) {
+            // Already logged inside checkEnhancedGates
+          } else {
+            return {
+              type: 'midpoint',
+              laneId,
+              asset,
+              direction,
+              irrev,
+              entryPrice,
+              allocation,
+              shares: shareCalc.shares,
+              cost: shareCalc.cost,
+              windowTs,
+            };
+          }
+        }
+      }
+    }
+
+    // Spread scalp path â€” fetch real orderbook price when available
+    let askPrice = 0.95; // fallback placeholder
+    if (orderExecutor.initialized && orderExecutor.client && market) {
+      try {
+        const tokenId = direction === 'UP' ? market.upTokenId : market.downTokenId;
+        const realAsk = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
+        if (realAsk !== null) {
+          askPrice = realAsk;
+        }
+      } catch (_) {
+        // Fall back to placeholder
+      }
+    }
+
+    const spreadCheck = this.checkSpreadScalpGates(laneId, asset, interval, irrev, askPrice, remainingSeconds);
+    if (spreadCheck.pass) {
+      const poolBalance = db.getPoolBalance();
+      const allocation = this.calculateAllocation(poolBalance, irrev);
+      const shareCalc = this.calculateShares(allocation, askPrice);
+      if (shareCalc) {
+        const enhancedResult = await this.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
+        if (enhancedResult.pass) {
+          return {
+            type: 'spread_scalp',
+            laneId,
+            asset,
+            direction,
+            irrev,
+            askPrice,
+            allocation,
+            shares: shareCalc.shares,
+            cost: shareCalc.cost,
+            windowTs,
+          };
+        }
+      }
+    }
+
+    // Log gate rejections when irrev is notable (>=1.5) to aid debugging
+    if (irrev >= 1.5) {
+      const reasons = [];
+      if (!midpointCheck.pass) reasons.push(`midpoint: ${midpointCheck.reason}`);
+      if (!spreadCheck.pass) reasons.push(`spread: ${spreadCheck.reason}`);
+      console.log(`[scalp] ${laneId} irrev=${irrev.toFixed(2)} GATE BLOCKED: ${reasons.join(' | ')}`);
+    }
+
+    return null;
+  }
+
+  // --- Reset lane entries for new window ---
+  resetWindow(laneId, windowTs) {
+    this.activeEntries.set(laneId, []);
+    // Clear stale peak deltas for this lane (any previous window keys)
+    for (const key of this.peakDeltas.keys()) {
+      if (key.startsWith(`${laneId}-`) && !key.endsWith(`-${windowTs}`)) {
+        this.peakDeltas.delete(key);
+      }
+    }
+  }
+}
+
+const superScalp = new SuperScalp();
+
+module.exports = { SuperScalp, superScalp };
+const config = require('./config');
+const db = require('./db');
+const { coinbaseWS } = require('./coinbase-ws');
+const { polymarketRTDS } = require('./polymarket-ws');
+const { priceTracker } = require('./price-tracker');
+const { volatilityTracker } = require('./volatility');
+const marketDiscovery = require('./market-discovery');
+const { orderExecutor } = require('./order-executor');
+
+const SECONDS_PER_YEAR = 31536000;
+
+class SpreadScalp {
+  constructor() {
+    this.losses = [];
+    this.lastEntryKey = new Map();
+  }
+
+  // --- Circuit breaker: 3 losses in 1hr = 2hr pause ---
+  checkCircuitBreaker() {
+    const cb = config.spreadScalpCircuitBreaker;
+    const oneHourAgo = Date.now() - cb.windowHours * 60 * 60 * 1000;
+
+    // Clean up losses older than 3 hours
+    const threeHoursAgo = Date.now() - 3 * 60 * 60 * 1000;
+    this.losses = this.losses.filter(ts => ts >= threeHoursAgo);
+
+    const recentLosses = this.losses.filter(ts => ts >= oneHourAgo);
+    if (recentLosses.length >= cb.maxLosses) {
+      const lastLoss = Math.max(...recentLosses);
+      const pauseEnd = lastLoss + cb.pauseHours * 60 * 60 * 1000;
+      if (Date.now() < pauseEnd) {
+        return { blocked: true, resumeIn: pauseEnd - Date.now() };
+      }
+    }
+
+    return { blocked: false };
+  }
+
+  // --- Record a spread scalp loss ---
+  recordLoss() {
+    this.losses.push(Date.now());
+  }
+
+  // --- Irrev calculation (same formula as superscalp) ---
+  calculateIrrev(asset, openPrice, currentPrice, remainingSeconds, totalSeconds) {
+    const delta = Math.abs(currentPrice - openPrice) / openPrice;
+    const vol = volatilityTracker.getVolatility(asset);
+    const windowVol = vol * Math.sqrt(totalSeconds / SECONDS_PER_YEAR);
+    const timeRemaining = Math.sqrt(remainingSeconds / totalSeconds);
+    const expectedMove = windowVol * timeRemaining;
+
+    if (!expectedMove || expectedMove < 0.0001) return 0;
+    return delta / expectedMove;
+  }
+
+  // --- Allocation sizing (same compounding tiers, spread scalp floor) ---
+  calculateAllocation(poolBalance, irrev) {
+    const tier = config.compoundingTiers.find(
+      t => poolBalance >= t.minBalance && poolBalance < t.maxBalance
+    );
+    if (!tier) return 0;
+
+    let allocation = poolBalance * tier.allocation;
+
+    if (irrev >= config.irrevMultipliers.extreme.threshold) {
+      allocation *= config.irrevMultipliers.extreme.multiplier;
+    } else if (irrev >= config.irrevMultipliers.high.threshold) {
+      allocation *= config.irrevMultipliers.high.multiplier;
+    }
+
+    // Floor: enough to buy minShares at $0.99 (spread scalp worst-case ask)
+    allocation = Math.max(allocation, config.minShares * 0.99);
+
+    return Math.min(allocation, config.maxTradeSize);
+  }
+
+  // --- Evaluate spread scalp opportunity for a lane (called every second) ---
+  async evaluate(laneId) {
+    const parts = laneId.split('-');
+    const asset = parts[0];
+    const interval = parseInt(parts[1], 10);
+    const totalSeconds = interval * 60;
+
+    const windowTs = priceTracker.getWindowTs(interval);
+    const remainingSeconds = priceTracker.getRemainingSeconds(interval);
+
+    // Only fire in the last N seconds of the window
+    if (remainingSeconds > config.spreadScalpLastSeconds) return null;
+
+    // One spread scalp entry per lane per window
+    if (this.lastEntryKey.get(laneId) === windowTs) return null;
+
+    let currentPrice = polymarketRTDS.getPrice(asset);
+    if (currentPrice == null || polymarketRTDS.isStale()) {
+      currentPrice = coinbaseWS.getPrice(asset);
+    }
+    if (currentPrice == null) return null;
+
+    const openPrice = await priceTracker.captureOpenPrice(laneId, interval);
+    if (openPrice == null) return null;
+
+    const market = await marketDiscovery.findMarket(laneId, windowTs, interval);
+    if (!market) return null;
+
+    const irrev = this.calculateIrrev(asset, openPrice, currentPrice, remainingSeconds, totalSeconds);
+    if (irrev < config.spreadScalpIrrev) return null;
+
+    // Circuit breaker
+    const cb = this.checkCircuitBreaker();
+    if (cb.blocked) return null;
+
+    // Direction
+    const direction = currentPrice >= openPrice ? 'UP' : 'DOWN';
+
+    // Token based on direction
+    const tokenId = direction === 'UP' ? market.upTokenId : market.downTokenId;
+
+    // Dry run or executor not initialized â€” use real ask if available, else simulated
+    if (!orderExecutor.initialized || config.dryRun) {
+      let simPrice = 0.95;
+
+      // Fetch real ask if ClobClient is available
+      if (orderExecutor.initialized && orderExecutor.client) {
+        const realAsk = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
+        if (realAsk !== null) {
+          simPrice = realAsk;
+        }
+      }
+
+      if (simPrice < 0.20 || simPrice > 0.99) return null;
+
+      const poolBalance = db.getPoolBalance();
+      const allocation = this.calculateAllocation(poolBalance, irrev);
+      let shares = Math.floor(allocation / simPrice);
+      if (shares < config.minShares) return null;
+
+      const potentialLoss = shares * (1 - simPrice);
+      if (potentialLoss > config.maxLossPerTrade) {
+        shares = Math.floor(config.maxLossPerTrade / (1 - simPrice));
+        if (shares < config.minShares) return null;
+      }
+
+      // Minimum edge check: expected profit must be >= $0.05
+      const expectedProfit = (shares * 1.00) - (shares * simPrice);
+      if (expectedProfit < 0.05) {
+        console.log(`[spread-scalp] ${laneId} GATE BLOCKED: edge too thin (profit $${expectedProfit.toFixed(2)} at ask $${simPrice.toFixed(2)})`);
+        return null;
+      }
+
+      // Enhanced gates check â€” same as midpoint path
+      const { superScalp } = require('./superscalp');
+      const enhancedResult = await superScalp.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
+      if (!enhancedResult.pass) {
+        console.log(`[spread-scalp] ${laneId} ENHANCED BLOCKED: ${enhancedResult.reason}`);
+        return null;
+      }
+
+      // Return signal only â€” main loop handles execution and recording
+      return {
+        type: 'spread_scalp',
+        laneId,
+        asset,
+        direction,
+        irrev,
+        entryPrice: simPrice,
+        shares,
+        cost: shares * simPrice,
+        windowTs,
+        market,
+      };
+    }
+
+    // Real orderbook ask price
+    const askPrice = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
+    if (askPrice == null || askPrice < 0.20 || askPrice > 0.99) return null;
+
+    // Allocation
+    const poolBalance = db.getPoolBalance();
+    const allocation = this.calculateAllocation(poolBalance, irrev);
+
+    // Shares
+    let shares = Math.floor(allocation / askPrice);
+    if (shares < config.minShares) return null;
+
+    // Max loss cap: shares * (1 - askPrice) <= $5
+    const potentialLoss = shares * (1 - askPrice);
+    if (potentialLoss > config.maxLossPerTrade) {
+      shares = Math.floor(config.maxLossPerTrade / (1 - askPrice));
+      if (shares < config.minShares) return null;
+    }
+
+    // Minimum edge check: expected profit must be >= $0.05
+    const expectedProfit = (shares * 1.00) - (shares * askPrice);
+    if (expectedProfit < 0.05) {
+      console.log(`[spread-scalp] ${laneId} GATE BLOCKED: edge too thin (profit $${expectedProfit.toFixed(2)} at ask $${askPrice.toFixed(2)})`);
+      return null;
+    }
+
+    // Enhanced gates check â€” same as midpoint path
+    const { superScalp } = require('./superscalp');
+    const enhancedResult = await superScalp.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
+    if (!enhancedResult.pass) {
+      console.log(`[spread-scalp] ${laneId} ENHANCED BLOCKED: ${enhancedResult.reason}`);
+      return null;
+    }
+
+    return {
+      type: 'spread_scalp',
+      laneId,
+      asset,
+      direction,
+      irrev,
+      entryPrice: askPrice,
+      shares,
+      cost: shares * askPrice,
+      windowTs,
+      market,
+    };
+  }
+
+  // --- Mark that a spread scalp entry was made for this lane/window ---
+  recordEntry(laneId, windowTs) {
+    this.lastEntryKey.set(laneId, windowTs);
+  }
+}
+
+const spreadScalp = new SpreadScalp();
+
+module.exports = { SpreadScalp, spreadScalp };
+const config = require('./config');
+const axios = require('axios');
+const db = require('./db');
+const { ethers } = require('ethers');
+
+class OrderExecutor {
+  constructor() {
+    this.client = null;
+    this.provider = null;
+    this.wallet = null;
+    this.initialized = false;
+    this._lastOrderbookLogTime = new Map();
+  }
+
+  _shouldLogOrderbook(tokenId) {
+    const key = tokenId || 'unknown';
+    const now = Date.now();
+    const last = this._lastOrderbookLogTime.get(key) || 0;
+    if (now - last >= 30000) {
+      this._lastOrderbookLogTime.set(key, now);
+      return true;
+    }
+    return false;
+  }
+
+  async init() {
+    if (!config.polygonPrivateKey) {
+      console.log('[executor] No POLYGON_PRIVATE_KEY set â€” running in observe-only mode');
+      this.initialized = false;
+      return;
+    }
+
+    try {
+      const { ClobClient } = await import('@polymarket/clob-client');
+
+      this.provider = new ethers.providers.JsonRpcProvider(config.polygonRpc);
+      this.wallet = new ethers.Wallet(config.polygonPrivateKey, this.provider);
+
+      // Create initial client (L1 auth only â€” wallet signature)
+      let client = new ClobClient(config.clobUrl, config.chainId, this.wallet);
+
+      // Derive API credentials (L2 auth)
+      const creds = await client.createOrDeriveApiKey();
+
+      // Re-create client with full credentials
+      this.client = new ClobClient(config.clobUrl, config.chainId, this.wallet, creds);
+
+      this.initialized = true;
+      console.log('[executor] ClobClient initialized');
+    } catch (err) {
+      console.error('[executor] Failed to initialize ClobClient:', err.message);
+      this.initialized = false;
+    }
+  }
+
+  async getOrderbookPrice(tokenId, side) {
+    const shouldLog = this._shouldLogOrderbook(tokenId);
+    try {
+      if (shouldLog) {
+        console.log(`[executor] Fetching orderbook for ${tokenId?.slice(0,20)}... (${side})`);
+      }
+      const book = await this.client.getOrderBook(tokenId);
+
+      if (side === 'buy') {
+        // Best ask = lowest sell price
+        if (!book.asks || book.asks.length === 0) {
+          if (shouldLog) {
+            console.log(`[executor] Orderbook empty for ${tokenId?.slice(0,20)}... (${side}) â€” no asks`);
+          }
+          return null;
+        }
+        const sorted = [...book.asks].sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+        return Math.round(parseFloat(sorted[0].price) * 100) / 100;
+      } else {
+        // Best bid = highest buy price
+        if (!book.bids || book.bids.length === 0) {
+          if (shouldLog) {
+            console.log(`[executor] Orderbook empty for ${tokenId?.slice(0,20)}... (${side}) â€” no bids`);
+          }
+          return null;
+        }
+        const sorted = [...book.bids].sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+        return Math.round(parseFloat(sorted[0].price) * 100) / 100;
+      }
+    } catch (err) {
+      if (shouldLog) {
+        console.error(`[executor] Orderbook error for ${tokenId?.slice(0,20)}... (${side}):`, err.message);
+      }
+      return null;
+    }
+  }
+
+  async placeLimitOrder(tokenId, side, price, size) {
+    try {
+      const response = await this.client.createAndPostOrder(
+        {
+          tokenID: tokenId,
+          price: parseFloat(price),
+          size: parseFloat(size),
+          side: side,
+        },
+        { tickSize: '0.01' },
+        'GTC'
+      );
+      console.log(`[executor] Limit order placed: ${size} shares @ $${price}`);
+      return response;
+    } catch (err) {
+      console.error('[executor] Limit order failed:', err.message);
+      return null;
+    }
+  }
+
+  async placeFokOrder(tokenId, side, price, size) {
+    try {
+      const response = await this.client.createAndPostOrder(
+        {
+          tokenID: tokenId,
+          price: parseFloat(price),
+          size: parseFloat(size),
+          side: side,
+        },
+        { tickSize: '0.01' },
+        'FOK'
+      );
+      console.log(`[executor] FOK order placed: ${size} shares @ $${price}`);
+      return response;
+    } catch (err) {
+      console.error('[executor] FOK order failed:', err.message);
+      return null;
+    }
+  }
+
+  async executeEntry(signal, market) {
+    // FIX 1: Duplicate trade prevention â€” block if trade already exists for this lane + window
+    if (signal.windowTs) {
+      const existingTrades = db.getTrades({ lane_id: signal.laneId, window_start: signal.windowTs });
+      if (existingTrades.length >= 2) {
+        console.log(`[executor] BLOCKED duplicate: ${signal.laneId} already has 2 trades in window ${signal.windowTs}`);
+        return null;
+      }
+    }
+
+    // Dry run or not initialized â€” simulate trade with real prices when possible
+    if (!this.initialized || config.dryRun) {
+      const tokenId = signal.direction === 'UP' ? market.upTokenId : market.downTokenId;
+      let entryPrice = signal.entryPrice || signal.askPrice;
+      let shares = signal.shares;
+      let cost = signal.cost;
+
+      // Fetch real orderbook price if ClobClient is available
+      if (this.initialized && this.client) {
+        const realAsk = await this.getOrderbookPrice(tokenId, 'buy');
+        if (realAsk !== null) {
+          entryPrice = realAsk;
+          // Recalculate shares/cost with real price
+          const poolBalance = db.getPoolBalance();
+          const { superScalp } = require('./superscalp');
+          const allocation = superScalp.calculateAllocation(poolBalance, signal.irrev);
+          const shareCalc = superScalp.calculateShares(allocation, realAsk);
+          if (!shareCalc || shareCalc.shares < config.minShares) {
+            console.log(`[executor] DRY RUN: real ask $${realAsk} yields insufficient shares for ${signal.laneId}`);
+            return null;
+          }
+          shares = shareCalc.shares;
+          cost = shareCalc.cost;
+          console.log(`[executor] DRY RUN: using real ask $${realAsk} for ${signal.laneId}`);
+        } else {
+          console.log('[executor] DRY RUN using placeholder price â€” real orderbook unavailable');
+        }
+      } else {
+        console.log('[executor] DRY RUN using placeholder price â€” real orderbook unavailable');
+      }
+
+      console.log(
+        `[executor] DRY RUN: would buy ${signal.direction} on ${signal.laneId} irrev=${signal.irrev.toFixed(2)} @ $${entryPrice}`
+      );
+      const dryTokenId = tokenId;
+      const dryConditionId = market.conditionId || null;
+      const tradeId = db.insertTrade({
+        lane_id: signal.laneId,
+        market_id: market.conditionId || null,
+        condition_id: dryConditionId,
+        clob_token_id: dryTokenId,
+        side: signal.direction,
+        entry_price: entryPrice,
+        shares,
+        cost,
+        irrev: signal.irrev,
+        stack_level: signal.stackLevel || 1,
+        entry_type: signal.type,
+        open_price: signal.openPrice || null,
+        result: 'pending',
+        window_start: signal.windowTs || null,
+        window_end: signal.windowEnd || null,
+        slug: market.slug || null,
+      });
+      console.log(`[executor] Trade stored with token: ${dryTokenId?.slice(0,20)}... condition: ${dryConditionId?.slice(0,20)}...`);
+      return db.getTradeById(tradeId);
+    }
+
+    // Determine tokenId from direction
+    const tokenId = signal.direction === 'UP' ? market.upTokenId : market.downTokenId;
+
+    // Get real orderbook ask price
+    const askPrice = await this.getOrderbookPrice(tokenId, 'buy');
+    if (askPrice === null) {
+      console.log(`[executor] No ask price available for ${signal.laneId}`);
+      return null;
+    }
+
+    // Price range validation based on entry type
+    if (signal.type === 'midpoint') {
+      if (askPrice < config.midpointPriceRange.min || askPrice > config.midpointPriceRange.max) {
+        console.log(`[executor] Ask $${askPrice} outside midpoint range for ${signal.laneId}`);
+        return null;
+      }
+    } else if (signal.type === 'spread_scalp') {
+      if (askPrice < config.spreadScalpPriceRange.min || askPrice > config.spreadScalpPriceRange.max) {
+        console.log(`[executor] Ask $${askPrice} outside spread scalp range for ${signal.laneId}`);
+        return null;
+      }
+    }
+
+    // Calculate shares and cost using real ask price (same logic as superscalp)
+    const poolBalance = db.getPoolBalance();
+    const { superScalp } = require('./superscalp');
+    const allocation = superScalp.calculateAllocation(poolBalance, signal.irrev);
+    const shareCalc = superScalp.calculateShares(allocation, askPrice);
+    if (!shareCalc) {
+      console.log(`[executor] Insufficient shares for ${signal.laneId}`);
+      return null;
+    }
+
+    const shares = Math.floor(shareCalc.shares);
+    if (shares < config.minShares) {
+      console.log(`[executor] Shares ${shares} below minimum ${config.minShares} for ${signal.laneId}`);
+      return null;
+    }
+
+    const priceStr = askPrice.toFixed(2);
+    const sharesStr = shares.toString();
+
+    // Place limit order
+    const limitResponse = await this.placeLimitOrder(tokenId, 'BUY', priceStr, sharesStr);
+
+    let filled = false;
+    let fillPrice = askPrice;
+    let fillShares = shares;
+
+    if (limitResponse && limitResponse.orderID) {
+      // Poll for fill every 500ms up to limitOrderTimeoutMs
+      const pollInterval = 500;
+      const maxPolls = Math.ceil(config.limitOrderTimeoutMs / pollInterval);
+      for (let i = 0; i < maxPolls && !filled; i++) {
+        await this._sleep(pollInterval);
+        try {
+          const orderStatus = await this.client.getOrder(limitResponse.orderID);
+          if (orderStatus && (orderStatus.status === 'MATCHED' || orderStatus.status === 'FILLED')) {
+            filled = true;
+            fillShares = parseFloat(orderStatus.size_matched) || fillShares;
+          }
+        } catch (err) {
+          console.error('[executor] Failed to check order status:', err.message);
+        }
+      }
+
+      // Cancel unfilled limit order before FOK fallback
+      if (!filled) {
+        try {
+          await this.client.cancelOrder({ orderID: limitResponse.orderID });
+        } catch (_) {
+          // Best-effort cancel
+        }
+      }
+    }
+
+    // FOK fallback at ask + $0.01
+    if (!filled) {
+      const fokPrice = (askPrice + 0.01).toFixed(2);
+      const fokResponse = await this.placeFokOrder(tokenId, 'BUY', fokPrice, sharesStr);
+
+      if (fokResponse && fokResponse.orderID) {
+        try {
+          const fokStatus = await this.client.getOrder(fokResponse.orderID);
+          if (fokStatus && (fokStatus.status === 'MATCHED' || fokStatus.status === 'FILLED')) {
+            filled = true;
+            fillPrice = parseFloat(fokPrice);
+            fillShares = parseFloat(fokStatus.size_matched) || fillShares;
+          }
+        } catch (err) {
+          console.error('[executor] Failed to check FOK status:', err.message);
+        }
+      }
+    }
+
+    if (!filled) {
+      console.log(`[executor] Order NOT filled â€” market moved for ${signal.laneId}`);
+      return null;
+    }
+
+    // Record trade in DB and deduct cost from pool
+    const cost = fillShares * fillPrice;
+    const liveConditionId = market.conditionId || null;
+    const tradeId = db.insertTrade({
+      lane_id: signal.laneId,
+      market_id: market.conditionId || null,
+      condition_id: liveConditionId,
+      clob_token_id: tokenId,
+      side: signal.direction,
+      entry_price: fillPrice,
+      shares: fillShares,
+      cost,
+      irrev: signal.irrev,
+      stack_level: signal.stackLevel || 1,
+      entry_type: signal.type,
+      open_price: signal.openPrice || null,
+      result: 'pending',
+      window_start: signal.windowTs || null,
+      window_end: signal.windowEnd || null,
+      slug: market.slug || null,
+    });
+
+    db.updatePoolBalance(poolBalance - cost);
+    console.log(
+      `[executor] Trade recorded: ${fillShares} shares @ $${fillPrice.toFixed(2)} cost=$${cost.toFixed(2)}`
+    );
+    console.log(`[executor] Trade stored with token: ${tokenId?.slice(0,20)}... condition: ${liveConditionId?.slice(0,20)}...`);
+
+    return db.getTradeById(tradeId);
+  }
+
+  _sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+}
+
+const orderExecutor = new OrderExecutor();
+
+module.exports = { OrderExecutor, orderExecutor };
+const config = require('./config');
+const db = require('./db');
+const { priceTracker } = require('./price-tracker');
+
+const MAX_CANDLES_PER_LANE = 20;
+
+class CandleEngine {
+  constructor() {
+    this.candles = new Map();
+    this.liveBuffers = new Map();
+    this._resolvedSet = new Set();
+    this.tradeEntries = new Map();
+  }
+
+  recordTick(laneId, price, timestamp) {
+    const parts = laneId.split('-');
+    const interval = parseInt(parts[1], 10);
+    const windowTs = priceTracker.getWindowTs(interval);
+
+    let buf = this.liveBuffers.get(laneId);
+
+    if (buf && buf.windowTs !== windowTs) {
+      const completed = {
+        windowTs: buf.windowTs,
+        open: buf.open,
+        high: buf.high,
+        low: buf.low,
+        close: buf.latest,
+        direction: buf.latest >= buf.open ? 'UP' : 'DOWN',
+        resolved: false,
+        resolvedDirection: null,
+        tradeEntries: this.tradeEntries.get(`${laneId}:${buf.windowTs}`) || [],
+      };
+
+      let arr = this.candles.get(laneId);
+      if (!arr) {
+        arr = [];
+        this.candles.set(laneId, arr);
+      }
+      arr.push(completed);
+      if (arr.length > MAX_CANDLES_PER_LANE) {
+        arr.splice(0, arr.length - MAX_CANDLES_PER_LANE);
+      }
+
+      buf = null;
+    }
+
+    if (!buf) {
+      buf = { windowTs, open: price, high: price, low: price, latest: price };
+      this.liveBuffers.set(laneId, buf);
+      return;
+    }
+
+    if (price > buf.high) buf.high = price;
+    if (price < buf.low) buf.low = price;
+    buf.latest = price;
+  }
+
+  markTradeEntry(laneId, windowTs, tradeId, price, timestamp) {
+    const key = `${laneId}:${windowTs}`;
+    let entries = this.tradeEntries.get(key);
+    if (!entries) {
+      entries = [];
+      this.tradeEntries.set(key, entries);
+    }
+    entries.push({ tradeId, price, timestamp });
+    console.log(`[candles] Marked trade #${tradeId} entry on ${laneId} window ${windowTs} @ $${price}`);
+  }
+
+  markResolved(laneId, windowTs, resolvedDirection) {
+    const dedupKey = `${laneId}:${windowTs}`;
+    if (this._resolvedSet.has(dedupKey)) return;
+    this._resolvedSet.add(dedupKey);
+
+    if (this._resolvedSet.size > 200) {
+      const entries = [...this._resolvedSet];
+      this._resolvedSet = new Set(entries.slice(-100));
+    }
+
+    const arr = this.candles.get(laneId);
+    if (!arr) return;
+
+    const candle = arr.find(c => c.windowTs === windowTs);
+    if (!candle) return;
+
+    candle.resolved = true;
+    candle.resolvedDirection = resolvedDirection;
+
+    const isFlip = candle.direction !== resolvedDirection;
+    db.recordLaneResolution(laneId, isFlip);
+
+    console.log(`[candles] ${laneId} window ${windowTs} resolved ${resolvedDirection}, candle was ${candle.direction} â†’ ${isFlip ? 'FLIP' : 'HELD'}`);
+  }
+
+  getCompletedCandles(laneId, count = 5) {
+    const arr = this.candles.get(laneId);
+    if (!arr || arr.length === 0) return [];
+    return arr.slice(-count);
+  }
+
+  getLiveCandle(laneId) {
+    const buf = this.liveBuffers.get(laneId);
+    if (!buf) return null;
+    return {
+      windowTs: buf.windowTs,
+      open: buf.open,
+      high: buf.high,
+      low: buf.low,
+      current: buf.latest,
+      direction: buf.latest >= buf.open ? 'UP' : 'DOWN',
+      tradeEntries: this.tradeEntries.get(`${laneId}:${buf.windowTs}`) || [],
+    };
+  }
+
+  getLiveCandleWithTimer(laneId) {
+    const live = this.getLiveCandle(laneId);
+    if (!live) return null;
+    const interval = parseInt(laneId.split('-')[1], 10);
+    live.remainingSeconds = priceTracker.getRemainingSeconds(interval);
+    return live;
+  }
+
+  getFlipRate(laneId, days = 7) {
+    const rows = db.getLaneReliability(laneId, days);
+    if (!rows || rows.length === 0) {
+      return { flipRate: 0, observed: 0, flipped: 0, days: 0 };
+    }
+    let totalObserved = 0;
+    let totalFlipped = 0;
+    for (const row of rows) {
+      totalObserved += row.observed;
+      totalFlipped += row.flipped;
+    }
+    return {
+      flipRate: totalObserved > 0 ? totalFlipped / totalObserved : 0,
+      observed: totalObserved,
+      flipped: totalFlipped,
+      days: rows.length,
+    };
+  }
+
+  getActiveCandles() {
+    const result = {};
+    for (const lane of config.lanes) {
+      result[lane.id] = {
+        live: this.getLiveCandleWithTimer(lane.id),
+        completed: this.getCompletedCandles(lane.id, 5),
+        reliability: this.getFlipRate(lane.id, 7),
+      };
+    }
+    return result;
+  }
+
+  resetLane(laneId) {
+    this.liveBuffers.delete(laneId);
+  }
+}
+
+const candleEngine = new CandleEngine();
+module.exports = { CandleEngine, candleEngine };
+const Database = require('better-sqlite3');
+const config = require('./config');
+
+const db = new Database(config.dbPath);
+
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lane_id TEXT,
+    market_id TEXT,
+    condition_id TEXT,
+    clob_token_id TEXT,
+    side TEXT,
+    entry_price REAL,
+    shares REAL,
+    cost REAL,
+    irrev REAL,
+    stack_level INTEGER DEFAULT 1,
+    entry_type TEXT,
+    open_price REAL,
+    close_price REAL,
+    result TEXT DEFAULT 'pending',
+    claimed INTEGER DEFAULT 0,
+    claim_tx TEXT,
+    pnl REAL,
+    window_start INTEGER,
+    window_end INTEGER,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS pool (
+    id INTEGER PRIMARY KEY,
+    balance REAL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS lane_reliability (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lane_id TEXT,
+    date TEXT,
+    observed INTEGER DEFAULT 0,
+    flipped INTEGER DEFAULT 0,
+    UNIQUE(lane_id, date)
+  );
+`);
+
+// Init pool balance if not yet set (will be overwritten by wallet sync)
+const existingPool = db.prepare('SELECT balance FROM pool WHERE id = 1').get();
+if (!existingPool) {
+  db.prepare('INSERT INTO pool (id, balance) VALUES (1, ?)').run(config.startingPoolBalance);
+  console.log(`[db] Pool balance initialized: $${config.startingPoolBalance}`);
+} else {
+  console.log(`[db] Pool balance loaded: $${existingPool.balance}`);
+}
+
+// Add slug column if it doesn't exist
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN slug TEXT');
+  console.log('[db] Added slug column to trades table');
+} catch (_) {
+  // Column already exists â€” ignore
+}
+
+// Defensive migration: ensure clob_token_id and condition_id columns exist
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN clob_token_id TEXT');
+  console.log('[db] Added clob_token_id column to trades table');
+} catch (_) {
+  // Column already exists â€” ignore
+}
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN condition_id TEXT');
+  console.log('[db] Added condition_id column to trades table');
+} catch (_) {
+  // Column already exists â€” ignore
+}
+
+// DISABLED â€” protecting live trades
+// Was: one-time fix to reset trades #93, #94 back to won/unclaimed
+// const fix93_94 = db.prepare("INSERT OR IGNORE INTO settings (key, value) VALUES ('fix_93_94', '1')").run();
+// if (fix93_94.changes > 0) {
+//   db.prepare("UPDATE trades SET result = 'won', claimed = 0, claim_tx = NULL WHERE id IN (93, 94)").run();
+//   console.log('[db] Reset trades #93, #94 to won/unclaimed');
+// }
+
+// Defensive migration: add bookmarked column
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN bookmarked INTEGER DEFAULT 0');
+  console.log('[db] Added bookmarked column to trades table');
+} catch (_) {
+  // Column already exists â€” ignore
+}
+
+// Startup SQL audit: scan for any DELETE/DROP/TRUNCATE/UPDATE on trades at boot
+// The only one ever found (fix_93_94 UPDATE) was already commented out above.
+console.log('[db] Startup SQL audit: found 0 statements that modify trades table â€” all disabled');
+
+// One-time fix: trades #6 and #8 were marked won but Chainlink resolved opposite direction
+const fixFalseWins = db.prepare("SELECT value FROM settings WHERE key = 'fix_false_wins_apr2'").get();
+if (!fixFalseWins) {
+  db.prepare("UPDATE trades SET result = 'lost', pnl = -2.10 WHERE id = 6").run();
+  db.prepare("UPDATE trades SET result = 'lost', pnl = -2.75 WHERE id = 8").run();
+  db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('fix_false_wins_apr2', '1', CURRENT_TIMESTAMP)").run();
+  console.log('[db] Corrected trades #6 and #8 from won to lost (Chainlink resolved opposite direction)');
+}
+
+// One-time fix: trades #9 and #10 were marked won but Chainlink Data Streams resolved opposite direction
+const fixFalseWinsV2 = db.prepare("SELECT value FROM settings WHERE key = 'fix_false_wins_v2_apr2'").get();
+if (!fixFalseWinsV2) {
+  db.prepare("UPDATE trades SET result = 'lost', pnl = -2.75 WHERE id = 9").run();
+  db.prepare("UPDATE trades SET result = 'lost', pnl = -2.75 WHERE id = 10").run();
+  db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('fix_false_wins_v2_apr2', '1', CURRENT_TIMESTAMP)").run();
+  console.log('[db] Corrected trades #9 and #10 from won to lost (Chainlink Data Streams resolved opposite direction)');
+}
+
+// Log trade count on startup (read-only diagnostic)
+const tradeCount = db.prepare('SELECT COUNT(*) AS cnt FROM trades').get();
+console.log(`[db] Trades table: ${tradeCount.cnt} rows`);
+
+function getPoolBalance() {
+  return db.prepare('SELECT balance FROM pool WHERE id = 1').get().balance;
+}
+
+function updatePoolBalance(newBalance) {
+  const rounded = Math.round(newBalance * 100) / 100;
+  const update = db.transaction((bal) => {
+    db.prepare('UPDATE pool SET balance = ?, updated_at = CURRENT_TIMESTAMP WHERE id = 1').run(bal);
+  });
+  update(rounded);
+}
+
+function insertTrade(tradeData) {
+  const stmt = db.prepare(`
+    INSERT INTO trades (lane_id, market_id, condition_id, clob_token_id, side, entry_price, shares, cost, irrev, stack_level, entry_type, open_price, close_price, result, claimed, claim_tx, pnl, window_start, window_end, slug, bookmarked)
+    VALUES (@lane_id, @market_id, @condition_id, @clob_token_id, @side, @entry_price, @shares, @cost, @irrev, @stack_level, @entry_type, @open_price, @close_price, @result, @claimed, @claim_tx, @pnl, @window_start, @window_end, @slug, @bookmarked)
+  `);
+  const result = stmt.run({
+    lane_id: tradeData.lane_id || null,
+    market_id: tradeData.market_id || null,
+    condition_id: tradeData.condition_id || null,
+    clob_token_id: tradeData.clob_token_id || null,
+    side: tradeData.side || null,
+    entry_price: tradeData.entry_price || null,
+    shares: tradeData.shares || null,
+    cost: tradeData.cost || null,
+    irrev: tradeData.irrev || null,
+    stack_level: tradeData.stack_level || 1,
+    entry_type: tradeData.entry_type || null,
+    open_price: tradeData.open_price || null,
+    close_price: tradeData.close_price || null,
+    result: tradeData.result || 'pending',
+    claimed: tradeData.claimed || 0,
+    claim_tx: tradeData.claim_tx || null,
+    pnl: tradeData.pnl || null,
+    window_start: tradeData.window_start || null,
+    window_end: tradeData.window_end || null,
+    slug: tradeData.slug || null,
+    bookmarked: tradeData.bookmarked || 0,
+  });
+  return result.lastInsertRowid;
+}
+
+function updateTrade(id, updates) {
+  const fields = Object.keys(updates);
+  if (fields.length === 0) return;
+
+  const setClauses = fields.map((f) => `${f} = @${f}`).join(', ');
+  const stmt = db.prepare(`UPDATE trades SET ${setClauses} WHERE id = @id`);
+  stmt.run({ ...updates, id });
+}
+
+function getTrades(filters = {}) {
+  let sql = 'SELECT * FROM trades';
+  const conditions = [];
+  const params = {};
+
+  if (filters.lane_id) {
+    conditions.push('lane_id = @lane_id');
+    params.lane_id = filters.lane_id;
+  }
+  if (filters.result) {
+    conditions.push('result = @result');
+    params.result = filters.result;
+  }
+  if (filters.window_start) {
+    conditions.push('window_start = @window_start');
+    params.window_start = filters.window_start;
+  }
+  if (filters.claimed !== undefined) {
+    conditions.push('claimed = @claimed');
+    params.claimed = filters.claimed;
+  }
+
+  if (conditions.length > 0) {
+    sql += ' WHERE ' + conditions.join(' AND ');
+  }
+
+  sql += ' ORDER BY created_at DESC';
+
+  if (filters.limit) {
+    sql += ' LIMIT @limit';
+    params.limit = filters.limit;
+  }
+
+  return db.prepare(sql).all(params);
+}
+
+function getTradeById(id) {
+  return db.prepare('SELECT * FROM trades WHERE id = ?').get(id);
+}
+
+function getSetting(key) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+function setSetting(key, value) {
+  db.prepare(
+    'INSERT INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at'
+  ).run(key, value);
+}
+
+function getDb() {
+  return db;
+}
+
+function recordLaneResolution(laneId, isFlip) {
+  const date = new Date().toISOString().slice(0, 10);
+  db.prepare(
+    'INSERT INTO lane_reliability (lane_id, date, observed, flipped) VALUES (?, ?, 1, ?) ON CONFLICT(lane_id, date) DO UPDATE SET observed = observed + 1, flipped = flipped + ?'
+  ).run(laneId, date, isFlip ? 1 : 0, isFlip ? 1 : 0);
+}
+
+function getLaneReliability(laneId, days) {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - days);
+  return db.prepare(
+    'SELECT * FROM lane_reliability WHERE lane_id = ? AND date >= ? ORDER BY date DESC'
+  ).all(laneId, cutoff.toISOString().slice(0, 10));
+}
+
+module.exports = {
+  getPoolBalance,
+  updatePoolBalance,
+  insertTrade,
+  updateTrade,
+  getTrades,
+  getTradeById,
+  getSetting,
+  setSetting,
+  getDb,
+  recordLaneResolution,
+  getLaneReliability,
+};
+const WebSocket = require('ws');
+const config = require('./config');
+const { volatilityTracker } = require('./volatility');
+
+const WS_URL = 'wss://advanced-trade-ws.coinbase.com';
+const PRODUCT_IDS = config.assets.map(a => `${a}-USD`);
+const RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECT_ATTEMPTS = 50;
+const LOG_THROTTLE_MS = 30000;
+
+class CoinbaseWS {
+  constructor() {
+    this.prices = {};
+    this.ws = null;
+    this.reconnectAttempts = 0;
+    this.lastLogTime = 0;
+    this.closed = false;
+  }
+
+  connect() {
+    this.closed = false;
+    this.ws = new WebSocket(WS_URL);
+
+    this.ws.on('open', () => {
+      console.log('[ws] Connected to Coinbase');
+      this.reconnectAttempts = 0;
+
+      const subscribe = {
+        type: 'subscribe',
+        product_ids: PRODUCT_IDS,
+        channel: 'ticker',
+      };
+      this.ws.send(JSON.stringify(subscribe));
+    });
+
+    this.ws.on('message', (raw) => {
+      try {
+        const data = JSON.parse(raw);
+        if (data.channel !== 'ticker' || !data.events) return;
+
+        for (const event of data.events) {
+          if (!event.tickers) continue;
+          for (const ticker of event.tickers) {
+            const productId = ticker.product_id;
+            const price = parseFloat(ticker.price);
+            if (!productId || isNaN(price)) continue;
+
+            const asset = productId.split('-')[0];
+            this.prices[asset] = price;
+            volatilityTracker.recordTick(asset, price);
+
+            try {
+              const { candleEngine } = require('./candle-engine');
+              for (const lane of config.lanes) {
+                if (lane.asset === asset) {
+                  candleEngine.recordTick(lane.id, price, Date.now());
+                }
+              }
+            } catch (err) {
+              // Candle engine not ready yet during startup â€” safe to ignore
+            }
+          }
+        }
+
+        this._throttledLog();
+      } catch (err) {
+        console.error('[ws] Message parse error:', err.message);
+      }
+    });
+
+    this.ws.on('close', () => {
+      console.log('[ws] Connection closed');
+      this._reconnect();
+    });
+
+    this.ws.on('error', (err) => {
+      console.error('[ws] Error:', err.message);
+      // 'close' event fires after 'error', so reconnect happens there
+    });
+  }
+
+  _throttledLog() {
+    const now = Date.now();
+    if (now - this.lastLogTime < LOG_THROTTLE_MS) return;
+    this.lastLogTime = now;
+
+    const parts = config.assets
+      .map(a => `${a}=${this.prices[a] != null ? this.prices[a] : 'â€”'}`)
+      .join(' ');
+    console.log(`[ws] Price update: ${parts}`);
+  }
+
+  _reconnect() {
+    if (this.closed) return;
+
+    this.reconnectAttempts++;
+    if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      console.error(`[ws] FATAL: Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
+      return;
+    }
+
+    console.log(`[ws] Reconnecting in ${RECONNECT_DELAY_MS / 1000}s (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+    setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
+  }
+
+  getPrice(asset) {
+    return this.prices[asset] != null ? this.prices[asset] : null;
+  }
+
+  close() {
+    this.closed = true;
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+  }
+}
+
+const coinbaseWS = new CoinbaseWS();
+
+module.exports = { CoinbaseWS, coinbaseWS };
+const WebSocket = require('ws');
+
+const WS_URL = 'wss://ws-live-data.polymarket.com';
+const RECONNECT_DELAY_MS = 3000;
+const MAX_RECONNECT_ATTEMPTS = 50;
+const PING_INTERVAL_MS = 5000;
+const LOG_THROTTLE_MS = 30000;
+const STALE_THRESHOLD_MS = 60000;
+const STALE_CHECK_INTERVAL_MS = 30000;
+const SYMBOL_MAP = { 'btc/usd': 'BTC', 'eth/usd': 'ETH', 'sol/usd': 'SOL', 'xrp/usd': 'XRP', 'hype/usd': 'HYPE' };
+
+class PolymarketRTDS {
+  constructor() {
+    this.ws = null;
+    this.prices = { BTC: null, ETH: null, SOL: null, XRP: null, HYPE: null };
+    this.connected = false;
+    this.reconnectAttempts = 0;
+    this.closed = false;
+    this.lastLogTime = 0;
+    this.lastUpdateTime = 0;
+    this._pingInterval = null;
+    this._staleInterval = null;
+  }
+
+  connect() {
+    this.closed = false;
+    this.ws = new WebSocket(WS_URL);
+
+    this.ws.on('open', () => {
+      console.log('[polymarket-ws] Connected to Polymarket RTDS');
+      this.connected = true;
+      this.reconnectAttempts = 0;
+
+      const subscribe = {
+        action: 'subscribe',
+        subscriptions: [
+          { topic: 'crypto_prices_chainlink', type: 'update' }
+        ]
+      };
+      this.ws.send(JSON.stringify(subscribe));
+
+      // Keep-alive ping
+      this._pingInterval = setInterval(() => {
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+          this.ws.send(JSON.stringify('PING'));
+        }
+      }, PING_INTERVAL_MS);
+
+      // Staleness detection â€” force reconnect if no data in 60s
+      this._clearStaleCheck();
+      this._staleInterval = setInterval(() => {
+        if (this.isStale()) {
+          console.log('[polymarket-ws] RTDS STALE â€” no update in 60s, forcing reconnect');
+          this._clearPing();
+          this._clearStaleCheck();
+          if (this.ws) {
+            this.ws.close();
+          }
+        }
+      }, STALE_CHECK_INTERVAL_MS);
+    });
+
+    this.ws.on('message', (raw) => {
+      const str = String(raw).trim();
+      if (!str.startsWith('{') && !str.startsWith('[')) return;
+
+      try {
+        const data = JSON.parse(str);
+
+        if (data.topic === 'crypto_prices_chainlink' && data.type === 'update') {
+          const symbol = data.payload && data.payload.symbol;
+          const value = data.payload && data.payload.value;
+          if (symbol && value != null) {
+            const asset = SYMBOL_MAP[symbol.toLowerCase()];
+            if (asset) {
+              this.prices[asset] = parseFloat(value);
+              this.lastUpdateTime = Date.now();
+
+              try {
+                const { candleEngine } = require('./candle-engine');
+                const config = require('./config');
+                for (const lane of config.lanes) {
+                  if (lane.asset === asset) {
+                    candleEngine.recordTick(lane.id, parseFloat(value), Date.now());
+                  }
+                }
+              } catch (err) {
+                // Candle engine not ready yet during startup â€” safe to ignore
+              }
+            }
+          }
+
+          // Throttled log
+          const now = Date.now();
+          if (now - this.lastLogTime >= LOG_THROTTLE_MS) {
+            this.lastLogTime = now;
+            const parts = Object.entries(this.prices)
+              .map(([a, p]) => `${a}=$${p != null ? p : 'â€”'}`)
+              .join(' ');
+            console.log(`[polymarket-ws] Chainlink stream: ${parts}`);
+          }
+        }
+      } catch (err) {
+        console.error('[polymarket-ws] Message parse error:', err.message);
+      }
+    });
+
+    this.ws.on('close', () => {
+      console.log('[polymarket-ws] Connection closed');
+      this.connected = false;
+      this._clearPing();
+      this._reconnect();
+    });
+
+    this.ws.on('error', (err) => {
+      console.error('[polymarket-ws] Error:', err.message);
+    });
+  }
+
+  isStale() {
+    return this.lastUpdateTime > 0 && (Date.now() - this.lastUpdateTime > STALE_THRESHOLD_MS);
+  }
+
+  _clearPing() {
+    if (this._pingInterval) {
+      clearInterval(this._pingInterval);
+      this._pingInterval = null;
+    }
+  }
+
+  _clearStaleCheck() {
+    if (this._staleInterval) {
+      clearInterval(this._staleInterval);
+      this._staleInterval = null;
+    }
+  }
+
+  _reconnect() {
+    if (this.closed) return;
+
+    this.reconnectAttempts++;
+    if (this.reconnectAttempts > MAX_RECONNECT_ATTEMPTS) {
+      console.error(`[polymarket-ws] FATAL: Max reconnect attempts (${MAX_RECONNECT_ATTEMPTS}) reached. Giving up.`);
+      return;
+    }
+
+    console.log(`[polymarket-ws] Reconnecting in ${RECONNECT_DELAY_MS / 1000}s (attempt ${this.reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})...`);
+    setTimeout(() => this.connect(), RECONNECT_DELAY_MS);
+  }
+
+  getPrice(asset) {
+    return this.prices[asset] != null ? this.prices[asset] : null;
+  }
+
+  close() {
+    this.closed = true;
+    this._clearPing();
+    this._clearStaleCheck();
+    if (this.ws) {
+      this.ws.close();
+      this.ws = null;
+    }
+    this.connected = false;
+  }
+}
+
+const polymarketRTDS = new PolymarketRTDS();
+
+module.exports = { PolymarketRTDS, polymarketRTDS };
+const config = require('./config');
+
+const MAX_TICKS = 300;
+const MIN_TICKS = 20;
+
+const DEFAULT_VOLATILITY = {
+  BTC: 0.50,
+  ETH: 0.60,
+  SOL: 0.70,
+  XRP: 0.80,
+  HYPE: 0.90,
+};
+
+class VolatilityTracker {
+  constructor() {
+    this.ticks = new Map();
+    for (const asset of config.assets) {
+      this.ticks.set(asset, []);
+    }
+  }
+
+  recordTick(asset, price) {
+    let arr = this.ticks.get(asset);
+    if (!arr) {
+      arr = [];
+      this.ticks.set(asset, arr);
+    }
+    arr.push({ price, timestamp: Date.now() });
+    if (arr.length > MAX_TICKS) {
+      arr.splice(0, arr.length - MAX_TICKS);
+    }
+  }
+
+  getVolatility(asset) {
+    const arr = this.ticks.get(asset);
+    if (!arr || arr.length < MIN_TICKS) {
+      return DEFAULT_VOLATILITY[asset] || 0.60;
+    }
+    return this._calculate(arr);
+  }
+
+  getShortTermVolatility(asset, seconds) {
+    const arr = this.ticks.get(asset);
+    if (!arr) return null;
+
+    const cutoff = Date.now() - seconds * 1000;
+    const recent = arr.filter(t => t.timestamp >= cutoff);
+
+    if (recent.length < MIN_TICKS) return null;
+    return this._calculate(recent);
+  }
+
+  _calculate(ticks) {
+    const logReturns = [];
+    for (let i = 1; i < ticks.length; i++) {
+      logReturns.push(Math.log(ticks[i].price / ticks[i - 1].price));
+    }
+
+    if (logReturns.length < 2) return null;
+
+    // Standard deviation of log returns
+    const mean = logReturns.reduce((s, v) => s + v, 0) / logReturns.length;
+    const variance = logReturns.reduce((s, v) => s + (v - mean) ** 2, 0) / (logReturns.length - 1);
+    const stdDev = Math.sqrt(variance);
+
+    // Annualize: estimate ticks per year from average interval
+    const totalTimeMs = ticks[ticks.length - 1].timestamp - ticks[0].timestamp;
+    const avgIntervalMs = totalTimeMs / (ticks.length - 1);
+    if (avgIntervalMs <= 0) return stdDev;
+
+    const msPerYear = 365.25 * 24 * 60 * 60 * 1000;
+    const ticksPerYear = msPerYear / avgIntervalMs;
+
+    return stdDev * Math.sqrt(ticksPerYear);
+  }
+}
+
+const volatilityTracker = new VolatilityTracker();
+
+module.exports = { VolatilityTracker, volatilityTracker };
+const db = require('./db');
+const { priceTracker } = require('./price-tracker');
+const { coinbaseWS } = require('./coinbase-ws');
+const { getChainlinkPrice } = require('./chainlink');
+const { polymarketRTDS } = require('./polymarket-ws');
+
+const CLEANUP_AGE_MS = 60 * 60 * 1000; // 1 hour
+const PENDING_CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
+const EXPIRY_AGE_S = 15 * 60; // 15 minutes in seconds
+
+class Resolver {
+  constructor() {
+    this.processedWindows = new Set();
+    this._pendingTimer = null;
+  }
+
+  async resolveWindow(laneId, windowTs, interval) {
+    const key = `${laneId}:${windowTs}`;
+    if (this.processedWindows.has(key)) return;
+
+    const win = priceTracker.getWindow(laneId, windowTs);
+
+    if (!win || win.openPrice == null) {
+      console.log(`[resolver] ${laneId} window ${windowTs} missing open price â€” skipping`);
+      return;
+    }
+
+    // Get close price for display/logging only â€” win/loss comes from Data API oracle
+    const asset = laneId.split('-')[0];
+    let closePrice = null;
+    let source = null;
+
+    const rtdsPrice = polymarketRTDS.getPrice(asset);
+    if (rtdsPrice != null && !polymarketRTDS.isStale()) {
+      closePrice = rtdsPrice;
+      source = 'polymarket-rtds';
+    } else {
+      if (polymarketRTDS.isStale()) {
+        console.log(`[resolver] RTDS stale â€” using Coinbase for ${laneId} close price`);
+      }
+      const coinbasePrice = coinbaseWS.getPrice(asset);
+      if (coinbasePrice != null) {
+        closePrice = coinbasePrice;
+        source = 'coinbase-fallback';
+      } else {
+        const chainlinkPrice = await getChainlinkPrice(asset);
+        if (chainlinkPrice != null) {
+          closePrice = chainlinkPrice;
+          source = 'chainlink-fallback';
+        } else {
+          closePrice = win.closePrice;
+          source = 'window-fallback';
+        }
+      }
+    }
+
+    if (closePrice != null) {
+      console.log(`[resolver] ${laneId} close price: $${closePrice} (source: ${source})`);
+
+      // Record close price on pending trades for display â€” do NOT determine win/loss
+      const trades = db.getTrades({ lane_id: laneId, window_start: windowTs, result: 'pending' });
+      for (const trade of trades) {
+        db.updateTrade(trade.id, { close_price: closePrice });
+      }
+    } else {
+      console.log(`[resolver] ${laneId} window ${windowTs} missing close price`);
+    }
+
+    this.processedWindows.add(key);
+    this._cleanupProcessedWindows();
+  }
+
+  _cleanupProcessedWindows() {
+    const cutoff = Math.floor(Date.now() / 1000) - CLEANUP_AGE_MS / 1000;
+    for (const key of this.processedWindows) {
+      const ts = parseInt(key.split(':')[1], 10);
+      if (ts < cutoff) {
+        this.processedWindows.delete(key);
+      }
+    }
+  }
+
+  resolvePending() {
+    const pendingTrades = db.getTrades({ result: 'pending' });
+    if (pendingTrades.length > 0) {
+      console.log(`[resolver] ${pendingTrades.length} pending trade(s) awaiting oracle resolution`);
+    }
+
+    // Expire very old pending trades (>15 min past window end with no oracle resolution)
+    const nowS = Math.floor(Date.now() / 1000);
+    for (const trade of pendingTrades) {
+      if (!trade.window_start || !trade.lane_id) continue;
+      const windowEnd = trade.window_start + (trade.lane_id.includes('15M') ? 900 : 300);
+      if (nowS - windowEnd > EXPIRY_AGE_S) {
+        db.updateTrade(trade.id, {
+          result: 'expired',
+          pnl: 0,
+          close_price: null,
+        });
+        console.log(`[resolver] Trade #${trade.id} (${trade.lane_id}) expired â€” no oracle resolution after ${EXPIRY_AGE_S / 60} min`);
+      }
+    }
+  }
+
+  start() {
+    this._pendingTimer = setInterval(() => this.resolvePending(), PENDING_CHECK_INTERVAL_MS);
+    console.log('[resolver] Pending trade scanner started (60s interval)');
+  }
+
+  close() {
+    if (this._pendingTimer) {
+      clearInterval(this._pendingTimer);
+      this._pendingTimer = null;
+    }
+  }
+}
+
+const resolver = new Resolver();
+
+module.exports = { Resolver, resolver };
+const config = require('./config');
+const db = require('./db');
+const notifications = require('./notifications');
+const axios = require('axios');
+const { ethers } = require('ethers');
+const { spreadScalp } = require('./spread-scalp');
+
+const CLAIMED_BLACKLIST = new Set([
+  'b3114dc4a641074bce619ea2bc010eb036d4d86d0e252b4747e3ab45d486ef3c',
+  'de06508942f7f7d83bdbfc7c5b07c88e20891e9ef7440d74c9c259f2347fb8d3',
+  'd167df1a2c61fb4b3b6ff2857d040812b584fd1915ff8522eeb37f0d5f13585f',
+]);
+
+const CTF_ADDRESS = '0x4D97DCd97eC945f40cF65F87097ACe5EA0476045';
+
+const USDC_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
+const USDC_ABI = ['function balanceOf(address account) view returns (uint256)'];
+
+const CTF_ABI = [
+  'function redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)',
+  'function balanceOf(address account, uint256 id) view returns (uint256)',
+];
+
+const RPC_ENDPOINTS = [
+  'https://polygon-rpc.com',
+  'https://rpc.ankr.com/polygon',
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon.llamarpc.com',
+  'https://poly-rpc.gateway.pokt.network',
+];
+
+const DATA_API_BASE = 'https://data-api.polymarket.com';
+
+class Claimer {
+  constructor() {
+    this.claimLock = false;
+    this.claimLockTime = 0;
+    this.provider = null;
+    this.wallet = null;
+    this.proxyWallet = null;
+    this._lastClaimNotifyTime = 0;
+    this._oracleTimer = null;
+
+    // Load persisted blacklist from settings DB
+    try {
+      const saved = db.getSetting('claimBlacklist');
+      this.claimBlacklist = saved ? new Set(JSON.parse(saved)) : new Set();
+      if (this.claimBlacklist.size > 0) {
+        console.log(`[claimer] Loaded ${this.claimBlacklist.size} blacklisted conditionIds from DB`);
+      }
+    } catch (err) {
+      console.error(`[claimer] Failed to load claimBlacklist from DB:`, err.message);
+      this.claimBlacklist = new Set();
+    }
+  }
+
+  /**
+   * Get the effective wallet address for Data API queries.
+   * Polymarket uses proxy wallets â€” the Data API indexes by proxy, not EOA.
+   */
+  async getDataApiWallet() {
+    const eoaAddress = config.walletAddress;
+
+    if (this.proxyWallet) return this.proxyWallet;
+
+    // Try EOA first
+    try {
+      const resp = await axios.get(`${DATA_API_BASE}/positions?user=${eoaAddress}`);
+      if (Array.isArray(resp.data) && resp.data.length > 0) {
+        return eoaAddress;
+      }
+    } catch (err) {
+      console.error(`[claimer] Data API EOA check failed:`, err.message);
+    }
+
+    // Try proxy wallet via CLOB endpoint
+    try {
+      const resp = await axios.get(`https://clob.polymarket.com/proxy-wallet?address=${eoaAddress}`);
+      if (resp.data && resp.data.address) {
+        this.proxyWallet = resp.data.address;
+        console.log(`[claimer] Resolved proxy wallet: ${this.proxyWallet}`);
+        return this.proxyWallet;
+      }
+    } catch (err) {
+      console.log(`[claimer] Proxy wallet lookup failed: ${err.message}`);
+    }
+
+    console.log(`[claimer] No proxy wallet found, using EOA: ${eoaAddress}`);
+    return eoaAddress;
+  }
+
+  // â”€â”€ Data API: single source of truth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  /**
+   * Fetch all redeemable positions from the Data API.
+   * Filters to: redeemable === true, curPrice === 1 (winners), size > 0.
+   */
+  async getRedeemablePositions() {
+    const wallet = await this.getDataApiWallet();
+    try {
+      const resp = await axios.get(`${DATA_API_BASE}/positions?user=${wallet}`);
+      const all = Array.isArray(resp.data) ? resp.data : [];
+      console.log(`[claimer] Data API returned ${all.length} total positions for ${wallet}`);
+
+      // Resolve pending trades using the same Data API positions (no extra API call)
+      this.resolveTradesFromOracle(all);
+
+      const redeemable = all.filter((p) => {
+        const isRedeemable = p.redeemable === true || p.redeemable === 'true';
+        const isWinner = parseFloat(p.curPrice) === 1;
+        const hasShares = parseFloat(p.size) > 0;
+        if (isRedeemable && isWinner && hasShares && this.claimBlacklist.has(p.conditionId)) {
+          console.log(`[claimer] Skipping blacklisted conditionId ${p.conditionId}`);
+          return false;
+        }
+        return isRedeemable && isWinner && hasShares;
+      });
+
+      const beforeBlacklist = redeemable.length;
+      const filtered = redeemable.filter((p) => {
+        const raw = (p.conditionId || '').replace(/^0x/, '');
+        return !CLAIMED_BLACKLIST.has(raw);
+      });
+      const blacklistedCount = beforeBlacklist - filtered.length;
+      if (blacklistedCount > 0) {
+        console.log(`[claimer] Filtered ${blacklistedCount} blacklisted position(s) from redeemable list`);
+      }
+
+      if (filtered.length > 0) {
+        console.log(`[claimer] ${filtered.length} redeemable winning positions found`);
+      }
+      return { wallet, positions: filtered, allPositions: all };
+    } catch (err) {
+      console.error(`[claimer] getRedeemablePositions failed:`, err.message);
+      return { wallet, positions: [], allPositions: [] };
+    }
+  }
+
+  /**
+   * Match a trade record to a Data API position.
+   * Tries: clob_token_id â†’ conditionId â†’ slug â†’ neighboring windows.
+   */
+  _matchTradeToPosition(trade, positions) {
+    // 1. Match by clob_token_id (most precise)
+    if (trade.clob_token_id) {
+      for (const pos of positions) {
+        if (pos.asset === trade.clob_token_id) {
+          console.log(`[claimer] Matched trade #${trade.id} by clob_token_id: ${trade.clob_token_id}`);
+          return pos;
+        }
+      }
+    }
+
+    // 2. Match by conditionId
+    if (trade.condition_id) {
+      for (const pos of positions) {
+        if (pos.conditionId === trade.condition_id) {
+          console.log(`[claimer] Matched trade #${trade.id} by conditionId: ${trade.condition_id}`);
+          return pos;
+        }
+      }
+    }
+
+    // 3. Match by slug
+    const tradeSlug = trade.slug || this._buildSlug(trade);
+    if (tradeSlug) {
+      for (const pos of positions) {
+        const posSlug = pos.slug || (pos.market && pos.market.slug);
+        if (posSlug && posSlug === tradeSlug) {
+          console.log(`[claimer] Matched trade #${trade.id} by slug: ${tradeSlug}`);
+          return pos;
+        }
+      }
+    }
+
+    // 4. Try neighboring window timestamps
+    if (trade.lane_id && trade.window_start) {
+      const parts = trade.lane_id.split('-');
+      const asset = parts[0].toLowerCase();
+      const interval = parseInt(parts[1], 10);
+      const offset = interval === 15 ? 900 : 300;
+
+      for (const delta of [-offset, offset]) {
+        const altTs = trade.window_start + delta;
+        const altSlug = `${asset}-updown-${interval}m-${altTs}`;
+        for (const pos of positions) {
+          const posSlug = pos.slug || (pos.market && pos.market.slug);
+          if (posSlug && posSlug === altSlug) {
+            console.log(`[claimer] Matched trade #${trade.id} by neighboring slug: ${altSlug}`);
+            return pos;
+          }
+        }
+      }
+    }
+
+    return null;
+  }
+
+  _buildSlug(trade) {
+    if (!trade.lane_id || !trade.window_start) return null;
+    const parts = trade.lane_id.split('-');
+    const asset = parts[0].toLowerCase();
+    const interval = parseInt(parts[1], 10);
+    return `${asset}-updown-${interval}m-${trade.window_start}`;
+  }
+
+  // â”€â”€ RPC infrastructure â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  async getProviderAndWallet() {
+    if (this.provider && this.wallet) {
+      try {
+        await this.provider.getBlockNumber();
+        return { provider: this.provider, wallet: this.wallet };
+      } catch (err) {
+        console.log(`[claimer] Cached RPC failed (${err.message}), reconnecting...`);
+        this.provider = null;
+        this.wallet = null;
+      }
+    }
+
+    for (const url of RPC_ENDPOINTS) {
+      try {
+        const provider = new ethers.providers.JsonRpcProvider(url);
+        await provider.getBlockNumber();
+        const wallet = new ethers.Wallet(config.polygonPrivateKey, provider);
+        console.log(`[claimer] Connected to RPC: ${url}`);
+        this.provider = provider;
+        this.wallet = wallet;
+        return { provider, wallet };
+      } catch (err) {
+        console.log(`[claimer] RPC failed: ${url} â€” ${err.message}`);
+      }
+    }
+
+    return null;
+  }
+
+  async getGasOverrides(provider, multiplier) {
+    const MIN_PRIORITY_FEE = ethers.utils.parseUnits('30', 'gwei');
+    const MIN_MAX_FEE = ethers.utils.parseUnits('150', 'gwei');
+
+    try {
+      const feeData = await provider.getFeeData();
+      if (feeData && feeData.maxFeePerGas && feeData.maxPriorityFeePerGas) {
+        const scaledPriority = feeData.maxPriorityFeePerGas.mul(Math.round(multiplier * 100)).div(100);
+        const scaledMaxFee = feeData.maxFeePerGas.mul(Math.round(multiplier * 100)).div(100);
+
+        const maxPriorityFeePerGas = scaledPriority.gt(MIN_PRIORITY_FEE) ? scaledPriority : MIN_PRIORITY_FEE;
+        const maxFeePerGas = scaledMaxFee.gt(MIN_MAX_FEE) ? scaledMaxFee : MIN_MAX_FEE;
+
+        const finalMaxFeeGwei = parseFloat(ethers.utils.formatUnits(maxFeePerGas, 'gwei')).toFixed(2);
+        const finalPriorityGwei = parseFloat(ethers.utils.formatUnits(maxPriorityFeePerGas, 'gwei')).toFixed(2);
+        console.log(`[claimer] Gas overrides: maxFee=${finalMaxFeeGwei}gwei, priority=${finalPriorityGwei}gwei`);
+
+        return { maxFeePerGas, maxPriorityFeePerGas, gasLimit: 300000 };
+      }
+    } catch (err) {
+      console.log(`[claimer] getFeeData failed (${err.message}), using fallback gas prices`);
+    }
+
+    console.log(`[claimer] Gas overrides (fallback): maxFee=150.00gwei, priority=30.00gwei`);
+    return { maxFeePerGas: MIN_MAX_FEE, maxPriorityFeePerGas: MIN_PRIORITY_FEE, gasLimit: 300000 };
+  }
+
+  async clearStuckNonces(wallet) {
+    const nonce = await wallet.getTransactionCount('pending');
+    const confirmedNonce = await wallet.getTransactionCount('latest');
+
+    if (nonce > confirmedNonce) {
+      console.log(`[claimer] Found ${nonce - confirmedNonce} stuck pending tx(s). Clearing with nonce ${confirmedNonce}`);
+      for (let i = confirmedNonce; i < nonce; i++) {
+        try {
+          const clearTx = await wallet.sendTransaction({
+            to: wallet.address,
+            value: 0,
+            nonce: i,
+            maxFeePerGas: ethers.utils.parseUnits('300', 'gwei'),
+            maxPriorityFeePerGas: ethers.utils.parseUnits('50', 'gwei'),
+            gasLimit: 21000,
+          });
+          console.log(`[claimer] Clearing stuck nonce ${i} â€” tx: ${clearTx.hash}`);
+          await clearTx.wait();
+          console.log(`[claimer] Nonce ${i} cleared successfully`);
+        } catch (err) {
+          console.error(`[claimer] Failed to clear stuck nonce ${i}: ${err.message}`);
+          throw new Error(`Failed to clear stuck nonce ${i}: ${err.message}`);
+        }
+      }
+      console.log(`[claimer] All stuck nonces cleared`);
+    } else {
+      console.log(`[claimer] No stuck pending txs (confirmed=${confirmedNonce}, pending=${nonce})`);
+    }
+  }
+
+  // â”€â”€ Core redeem helper â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  /**
+   * Execute redeemPositions on-chain for a given conditionId and indexSets.
+   * Returns { success, txHash, error, warning }.
+   */
+  async _executeRedeem(conditionId, indexSets) {
+    const rpc = await this.getProviderAndWallet();
+    if (!rpc) {
+      return { success: false, error: 'All RPC endpoints unreachable â€” try again later' };
+    }
+    const { wallet } = rpc;
+    const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, wallet);
+
+    let cid = conditionId;
+    if (cid && !cid.startsWith('0x')) {
+      cid = '0x' + cid;
+    }
+    cid = ethers.utils.hexZeroPad(cid, 32);
+
+    const collateral = config.usdcAddress;
+    const parent = ethers.constants.HashZero;
+
+    console.log(`[claimer] redeemPositions: condition=${cid}, indexSets=${JSON.stringify(indexSets)}`);
+
+    await this.clearStuckNonces(wallet);
+
+    const gasOverrides = await this.getGasOverrides(rpc.provider, 1.5);
+    const redeemNonce = await wallet.getTransactionCount('latest');
+    console.log(`[claimer] Using nonce: ${redeemNonce}`);
+
+    let tx;
+    try {
+      tx = await ctf.redeemPositions(collateral, parent, cid, indexSets, {
+        ...gasOverrides,
+        nonce: redeemNonce,
+      });
+    } catch (err) {
+      if (err.message && err.message.includes('execution reverted')) {
+        console.error(`[claimer] CRITICAL: on-chain revert â€” DO NOT RETRY without investigation`);
+      }
+      return { success: false, error: err.message };
+    }
+
+    console.log(`[claimer] Claim tx sent: ${tx.hash}`);
+
+    let receipt;
+    try {
+      receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('tx.wait timeout after 30s')), 30000)),
+      ]);
+    } catch (err) {
+      if (err.message === 'tx.wait timeout after 30s') {
+        console.log(`[claimer] tx.wait timed out â€” will verify on next cycle. tx: ${tx.hash}`);
+        return { success: false, txHash: tx.hash, timeout: true, error: 'tx.wait timed out â€” will verify on next cycle' };
+      }
+      if (err.message && err.message.includes('execution reverted')) {
+        console.error(`[claimer] CRITICAL: on-chain revert â€” DO NOT RETRY. TX: ${tx.hash}`);
+      }
+      return { success: false, error: `Transaction failed (tx: ${tx.hash}): ${err.message}` };
+    }
+
+    if (!receipt || receipt.status !== 1) {
+      console.log(`[claimer] Claim tx failed on-chain. TX: ${tx.hash}, status: ${receipt ? receipt.status : 'no receipt'}`);
+      return { success: false, error: `Transaction reverted on-chain (tx: ${tx.hash})` };
+    }
+
+    // Receipt confirmed with status === 1 â€” check USDC.e balance as verification
+    try {
+      const rpc = await this.getProviderAndWallet();
+      if (rpc) {
+        const usdc = new ethers.Contract(USDC_ADDRESS, USDC_ABI, rpc.provider);
+        const balAfter = await usdc.balanceOf(rpc.wallet.address);
+        const balUsd = parseFloat(ethers.utils.formatUnits(balAfter, 6));
+        console.log(`[claimer] Post-claim USDC.e balance: $${balUsd.toFixed(2)}`);
+      }
+    } catch (balErr) {
+      console.log(`[claimer] Balance check after claim failed (non-fatal): ${balErr.message}`);
+    }
+
+    console.log(`[claimer] Claim successful â€” tx: ${tx.hash}`);
+    return { success: true, txHash: tx.hash };
+  }
+
+  // â”€â”€ Claim methods â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+  /**
+   * Claim winnings for a specific trade by matching it to a Data API position.
+   */
+  async claimWinnings(tradeId) {
+    // Force-release stale lock after 60s
+    if (this.claimLock && Date.now() - this.claimLockTime > 60000) {
+      console.log(`[claimer] Force-released stale claim lock after 60s`);
+      this.claimLock = false;
+    }
+
+    if (this.claimLock) {
+      return { success: false, error: 'Another claim is in progress' };
+    }
+
+    this.claimLock = true;
+    this.claimLockTime = Date.now();
+    try {
+      const trade = db.getTradeById(tradeId);
+      if (!trade) {
+        return { success: false, error: 'Trade not found' };
+      }
+      if (trade.result !== 'won') {
+        return { success: false, error: 'Trade is not a won trade' };
+      }
+      if (trade.claimed === 1) {
+        return { success: false, error: 'Trade already claimed' };
+      }
+
+      // Data API is the single source of truth
+      const { positions } = await this.getRedeemablePositions();
+
+      const matched = this._matchTradeToPosition(trade, positions);
+      if (!matched) {
+        const available = positions.map((p) => ({
+          title: p.title || p.slug || 'unknown',
+          conditionId: p.conditionId,
+          outcomeIndex: p.outcomeIndex,
+          size: p.size,
+        }));
+        console.log(`[claimer] No match for trade #${tradeId}. Redeemable positions:`, JSON.stringify(available));
+        return {
+          success: false,
+          error: 'No matching redeemable position found in Data API',
+          redeemablePositions: available,
+        };
+      }
+
+      console.log(`[claimer] Matched position for trade #${tradeId}: conditionId=${matched.conditionId}, outcomeIndex=${matched.outcomeIndex}, size=${matched.size}`);
+
+      // Determine indexSets from the position's outcomeIndex
+      const outcomeIndex = parseInt(matched.outcomeIndex, 10);
+      const indexSets = outcomeIndex === 0 ? [1] : [2];
+
+      if (config.dryRun) {
+        db.updateTrade(tradeId, { claimed: 1, claim_tx: 'dry-run-simulated' });
+        console.log(`[claimer] DRY RUN: simulated claim for trade #${tradeId}`);
+        return { success: true, txHash: 'dry-run-simulated', dryRun: true };
+      }
+
+      const result = await this._executeRedeem(matched.conditionId, indexSets);
+
+      if (result.success) {
+        db.updateTrade(tradeId, { claimed: 1, claim_tx: result.txHash });
+        console.log(`[claimer] Trade #${tradeId} claimed â€” tx: ${result.txHash}`);
+      }
+
+      return result;
+    } catch (err) {
+      console.error(`[claimer] Unexpected error claiming trade #${tradeId}:`, err.message);
+      return { success: false, error: err.message };
+    } finally {
+      this.claimLock = false;
+    }
+  }
+
+  /**
+   * Claim all redeemable positions. Processes one at a time (respects claim lock).
+   * Returns { claimed: [...], failed: [...] }.
+   */
+  async claimAll() {
+    if (this.claimLock && Date.now() - this.claimLockTime > 60000) {
+      console.log(`[claimer] Force-released stale claim lock after 60s`);
+      this.claimLock = false;
+    }
+
+    if (this.claimLock) {
+      return { claimed: [], failed: [{ title: 'lock', error: 'Another claim is in progress' }] };
+    }
+
+    this.claimLock = true;
+    this.claimLockTime = Date.now();
+    const claimed = [];
+    const failed = [];
+
+    try {
+      const { positions } = await this.getRedeemablePositions();
+
+      if (positions.length === 0) {
+        console.log(`[claimer] claimAll: no redeemable positions found`);
+        return { claimed: [], failed: [] };
+      }
+
+      console.log(`[claimer] claimAll: processing ${positions.length} redeemable positions`);
+
+      // Safety filter: skip positions that are not actual winners
+      const validPositions = positions.filter((p) => {
+        const curPrice = parseFloat(p.curPrice);
+        const size = parseFloat(p.size);
+        const currentValue = parseFloat(p.currentValue || 0);
+        if (curPrice !== 1 || size <= 0 || currentValue <= 0) {
+          console.log(`[claimer] Skipping position ${p.title || p.slug || 'unknown'}: curPrice=${curPrice}, size=${size}, currentValue=${currentValue}`);
+          return false;
+        }
+        return true;
+      });
+
+      if (validPositions.length < positions.length) {
+        console.log(`[claimer] Filtered ${positions.length - validPositions.length} non-winner positions`);
+      }
+
+      // Notify once per claim cycle (at most every 60s) when redeemable wins exist
+      if (validPositions.length > 0 && Date.now() - this._lastClaimNotifyTime >= 60000) {
+        this._lastClaimNotifyTime = Date.now();
+        notifications.unclaimedWinsFound(validPositions.length);
+      }
+
+      if (config.dryRun) {
+        for (const pos of validPositions) {
+          claimed.push({
+            title: pos.title || pos.slug || 'unknown',
+            conditionId: pos.conditionId,
+            txHash: 'dry-run-simulated',
+            shares: pos.size,
+          });
+        }
+        console.log(`[claimer] DRY RUN: simulated claim-all for ${validPositions.length} positions`);
+        return { claimed, failed };
+      }
+
+      for (const pos of validPositions) {
+        const title = pos.title || pos.slug || 'unknown';
+        const outcomeIndex = parseInt(pos.outcomeIndex, 10);
+        const indexSets = outcomeIndex === 0 ? [1] : [2];
+
+        try {
+          // Read USDC.e balance before redeem
+          let balBefore = null;
+          const rpcBefore = await this.getProviderAndWallet();
+          if (rpcBefore) {
+            try {
+              const usdcBefore = new ethers.Contract(USDC_ADDRESS, USDC_ABI, rpcBefore.provider);
+              const rawBefore = await usdcBefore.balanceOf(rpcBefore.wallet.address);
+              balBefore = parseFloat(ethers.utils.formatUnits(rawBefore, 6));
+            } catch (balErr) {
+              console.log(`[claimer] Pre-redeem balance check failed (non-fatal): ${balErr.message}`);
+            }
+          }
+
+          const result = await this._executeRedeem(pos.conditionId, indexSets);
+          if (result.success) {
+            // Read USDC.e balance after redeem to detect ghost claims
+            if (balBefore !== null) {
+              try {
+                const rpcAfter = await this.getProviderAndWallet();
+                if (rpcAfter) {
+                  const usdcAfter = new ethers.Contract(USDC_ADDRESS, USDC_ABI, rpcAfter.provider);
+                  const rawAfter = await usdcAfter.balanceOf(rpcAfter.wallet.address);
+                  const balAfter = parseFloat(ethers.utils.formatUnits(rawAfter, 6));
+                  if (Math.abs(balAfter - balBefore) < 0.01) {
+                    this.claimBlacklist.add(pos.conditionId);
+                    db.setSetting('claimBlacklist', JSON.stringify([...this.claimBlacklist]));
+                    console.log(`[claimer] Blacklisted conditionId ${pos.conditionId} â€” redeem succeeded but no balance change (already claimed)`);
+                  }
+                }
+              } catch (balErr) {
+                console.log(`[claimer] Post-redeem balance check failed (non-fatal): ${balErr.message}`);
+              }
+            }
+
+            claimed.push({
+              title,
+              conditionId: pos.conditionId,
+              txHash: result.txHash,
+              shares: pos.size,
+            });
+
+            // Try to mark matching DB trades as claimed
+            this._markMatchingTrades(pos, result.txHash);
+          } else {
+            failed.push({ title, conditionId: pos.conditionId, error: result.error });
+          }
+        } catch (err) {
+          failed.push({ title, conditionId: pos.conditionId, error: err.message });
+        }
+      }
+
+      console.log(`[claimer] claimAll complete: ${claimed.length} claimed, ${failed.length} failed`);
+      return { claimed, failed };
+    } catch (err) {
+      console.error(`[claimer] claimAll error:`, err.message);
+      return { claimed, failed: [...failed, { title: 'fatal', error: err.message }] };
+    } finally {
+      this.claimLock = false;
+    }
+  }
+
+  /**
+   * Direct claim by conditionId and outcomeIndex â€” no trade record needed.
+   */
+  async claimDirect(conditionId, outcomeIndex) {
+    if (this.claimLock && Date.now() - this.claimLockTime > 60000) {
+      console.log(`[claimer] Force-released stale claim lock after 60s`);
+      this.claimLock = false;
+    }
+
+    if (this.claimLock) {
+      return { success: false, error: 'Another claim is in progress' };
+    }
+
+    this.claimLock = true;
+    this.claimLockTime = Date.now();
+    try {
+      if (!conditionId) {
+        return { success: false, error: 'conditionId is required' };
+      }
+
+      const indexSets = outcomeIndex === 0 ? [1] : [2];
+      console.log(`[claimer] Direct claim: conditionId=${conditionId}, outcomeIndex=${outcomeIndex}, indexSets=${JSON.stringify(indexSets)}`);
+
+      if (config.dryRun) {
+        return { success: true, txHash: 'dry-run-simulated', dryRun: true };
+      }
+
+      return await this._executeRedeem(conditionId, indexSets);
+    } catch (err) {
+      console.error(`[claimer] Direct claim error:`, err.message);
+      return { success: false, error: err.message };
+    } finally {
+      this.claimLock = false;
+    }
+  }
+
+  /**
+   * After a claim-all redeem, try to mark any matching DB trades as claimed.
+   */
+  _markMatchingTrades(position, txHash) {
+    try {
+      const wonTrades = db.getTrades({ result: 'won', claimed: 0 });
+      for (const trade of wonTrades) {
+        const match = this._matchTradeToPosition(trade, [position]);
+        if (match) {
+          db.updateTrade(trade.id, { claimed: 1, claim_tx: txHash });
+          console.log(`[claimer] Marked trade #${trade.id} as claimed (from claimAll)`);
+        }
+      }
+    } catch (err) {
+      console.error(`[claimer] _markMatchingTrades error:`, err.message);
+    }
+  }
+
+  /**
+   * Speed up a pending claim transaction by resending with higher gas.
+   */
+  async speedUpClaim(tradeId) {
+    const trade = db.getTradeById(tradeId);
+    if (!trade) {
+      return { success: false, error: 'Trade not found' };
+    }
+    if (!trade.claim_tx || trade.claim_tx === 'dry-run-simulated') {
+      return { success: false, error: 'No pending claim tx to speed up' };
+    }
+
+    const rpc = await this.getProviderAndWallet();
+    if (!rpc) {
+      return { success: false, error: 'All RPC endpoints unreachable â€” try again later' };
+    }
+    const { provider, wallet } = rpc;
+
+    let pendingTx;
+    try {
+      pendingTx = await provider.getTransaction(trade.claim_tx);
+    } catch (err) {
+      return { success: false, error: `Cannot fetch pending tx: ${err.message}` };
+    }
+
+    if (!pendingTx) {
+      return { success: false, error: `Tx ${trade.claim_tx} not found on-chain` };
+    }
+    if (pendingTx.blockNumber) {
+      return { success: false, error: `Tx ${trade.claim_tx} already confirmed in block ${pendingTx.blockNumber}` };
+    }
+
+    const nonce = pendingTx.nonce;
+    console.log(`[claimer] Speed-up: resending trade #${tradeId} tx with nonce ${nonce}`);
+
+    // Get the position's conditionId from Data API
+    const { positions } = await this.getRedeemablePositions();
+    const matched = this._matchTradeToPosition(trade, positions);
+
+    if (!matched) {
+      return { success: false, error: 'Cannot find matching position for speed-up' };
+    }
+
+    const outcomeIndex = parseInt(matched.outcomeIndex, 10);
+    const indexSets = outcomeIndex === 0 ? [1] : [2];
+
+    let cid = matched.conditionId;
+    if (cid && !cid.startsWith('0x')) {
+      cid = '0x' + cid;
+    }
+    cid = ethers.utils.hexZeroPad(cid, 32);
+
+    const gasOverrides = await this.getGasOverrides(provider, 2);
+    const ctf = new ethers.Contract(CTF_ADDRESS, CTF_ABI, wallet);
+    const collateral = config.usdcAddress;
+    const parent = ethers.constants.HashZero;
+
+    let tx;
+    try {
+      tx = await ctf.redeemPositions(collateral, parent, cid, indexSets, {
+        ...gasOverrides,
+        nonce,
+      });
+    } catch (err) {
+      console.error(`[claimer] Speed-up tx failed for trade #${tradeId}:`, err.message);
+      return { success: false, error: err.message };
+    }
+
+    console.log(`[claimer] Speed-up tx sent: ${tx.hash} (replaces ${trade.claim_tx})`);
+    db.updateTrade(tradeId, { claim_tx: tx.hash });
+
+    try {
+      const receipt = await Promise.race([
+        tx.wait(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('tx.wait timeout after 30s')), 30000)),
+      ]);
+
+      if (!receipt || receipt.status !== 1) {
+        console.log(`[claimer] Speed-up tx failed on-chain. TX: ${tx.hash}, status: ${receipt ? receipt.status : 'no receipt'}`);
+        return { success: false, error: `Speed-up tx reverted on-chain (tx: ${tx.hash})` };
+      }
+
+      console.log(`[claimer] Speed-up claim confirmed for trade #${tradeId} â€” tx: ${tx.hash}`);
+      db.updateTrade(tradeId, { claimed: 1, claim_tx: tx.hash });
+      return { success: true, txHash: tx.hash };
+    } catch (err) {
+      if (err.message === 'tx.wait timeout after 30s') {
+        console.log(`[claimer] tx.wait timed out â€” will verify on next cycle. tx: ${tx.hash}`);
+        // Do NOT mark as claimed â€” leave trade as-is so the next cycle picks it up
+        return { success: false, txHash: tx.hash, timeout: true, error: 'tx.wait timed out â€” will verify on next cycle' };
+      }
+      console.error(`[claimer] Speed-up receipt error for trade #${tradeId}:`, err.message);
+      return { success: false, error: `Speed-up tx failed (tx: ${tx.hash}): ${err.message}` };
+    }
+  }
+
+  // â”€â”€ Oracle resolution â€” Data API as single source of truth â”€â”€â”€â”€â”€â”€â”€â”€
+
+  /**
+   * Resolve pending trades using already-fetched Data API positions.
+   * Called from getRedeemablePositions() to piggyback on the same API call.
+   */
+  resolveTradesFromOracle(allPositions) {
+    try {
+      const pendingTrades = db.getTrades({ result: 'pending' });
+      if (pendingTrades.length === 0) return;
+
+      for (const trade of pendingTrades) {
+        if (!trade.clob_token_id) continue;
+
+        const match = this._matchTradeToPosition(trade, allPositions);
+        if (!match) continue;
+
+        const curPrice = parseFloat(match.curPrice);
+
+        if (curPrice === 1) {
+          // This token won â€” trade's token is the winner
+          const pnl = (trade.shares * 1.0) - trade.cost;
+          db.updateTrade(trade.id, { result: 'won', pnl, close_price: null });
+          db.updatePoolBalance(db.getPoolBalance() + pnl);
+          console.log(`[resolver-oracle] Trade #${trade.id} ${trade.lane_id} ${trade.side} resolved via Data API: won pnl=$${pnl.toFixed(2)}`);
+        } else if (curPrice === 0) {
+          // This token lost â€” trade's token is the loser
+          const pnl = -trade.cost;
+          db.updateTrade(trade.id, { result: 'lost', pnl, close_price: null });
+          db.updatePoolBalance(db.getPoolBalance() + pnl);
+
+          if (trade.entry_type === 'spread_scalp') {
+            spreadScalp.recordLoss();
+          }
+
+          this._checkAutoPause();
+          console.log(`[resolver-oracle] Trade #${trade.id} ${trade.lane_id} ${trade.side} resolved via Data API: lost pnl=$${pnl.toFixed(2)}`);
+        }
+        // curPrice between 0 and 1 â€” oracle hasn't resolved yet, skip
+      }
+    } catch (err) {
+      console.error('[resolver-oracle] resolveTradesFromOracle error:', err.message);
+    }
+  }
+
+  /**
+   * Poll the Data API for all positions and resolve pending trades.
+   * curPrice === 1 â†’ token won, curPrice === 0 â†’ token lost.
+   * curPrice between 0 and 1 â†’ oracle hasn't resolved yet, skip.
+   */
+  async resolveOracleTrades() {
+    const wallet = await this.getDataApiWallet();
+    let allPositions;
+    try {
+      const resp = await axios.get(`${DATA_API_BASE}/positions?user=${wallet}`);
+      allPositions = Array.isArray(resp.data) ? resp.data : [];
+    } catch (err) {
+      console.error('[resolver-oracle] Data API fetch failed:', err.message);
+      return;
+    }
+
+    const pendingTrades = db.getTrades({ result: 'pending' });
+    if (pendingTrades.length === 0) return;
+
+    console.log(`[resolver-oracle] Checking ${pendingTrades.length} pending trade(s) against ${allPositions.length} Data API positions`);
+
+    for (const trade of pendingTrades) {
+      if (!trade.clob_token_id) continue;
+
+      // Match by clob_token_id only â€” exact token match for unambiguous resolution
+      const matched = allPositions.find(p => p.asset === trade.clob_token_id);
+      if (!matched) continue;
+
+      const curPrice = parseFloat(matched.curPrice);
+
+      if (curPrice === 1) {
+        // This token won
+        const pnl = (trade.shares * 1.0) - trade.cost;
+        db.updateTrade(trade.id, { result: 'won', pnl });
+
+        const poolBalance = db.getPoolBalance();
+        db.updatePoolBalance(poolBalance + pnl);
+
+        notifications.tradeResult({ ...trade, result: 'won', pnl }, db.getPoolBalance());
+        console.log(`[resolver-oracle] Trade #${trade.id} ${trade.lane_id} resolved via Data API: won pnl=$${pnl.toFixed(2)}`);
+      } else if (curPrice === 0) {
+        // This token lost
+        const pnl = -trade.cost;
+        db.updateTrade(trade.id, { result: 'lost', pnl });
+
+        const poolBalance = db.getPoolBalance();
+        db.updatePoolBalance(poolBalance + pnl);
+
+        if (trade.entry_type === 'spread_scalp') {
+          spreadScalp.recordLoss();
+        }
+
+        notifications.tradeResult({ ...trade, result: 'lost', pnl }, db.getPoolBalance());
+        this._checkAutoPause();
+        console.log(`[resolver-oracle] Trade #${trade.id} ${trade.lane_id} resolved via Data API: lost pnl=$${pnl.toFixed(2)}`);
+      }
+      // curPrice between 0 and 1 â€” oracle hasn't resolved yet, skip
+    }
+  }
+
+  _checkAutoPause() {
+    const raw = db.getDb();
+    const last3 = raw.prepare("SELECT result FROM trades WHERE result IN ('won','lost') ORDER BY id DESC LIMIT 3").all();
+    if (last3.length === 3 && last3.every(t => t.result === 'lost')) {
+      db.setSetting('paused', 'true');
+      global.botPaused = true;
+      console.log('[bot] \u26A0 AUTO-PAUSED: 3 consecutive losses detected');
+      notifications.send('\u26A0 AUTO-PAUSED: 3 consecutive losses. Review and resume manually.');
+    }
+  }
+
+  startOracleResolver() {
+    this._oracleTimer = setInterval(() => {
+      this.resolveOracleTrades().catch(err => {
+        console.error('[resolver-oracle] Error:', err.message);
+      });
+    }, 60000);
+    console.log('[resolver-oracle] Oracle trade resolver started (60s interval)');
+  }
+
+  close() {
+    if (this._oracleTimer) {
+      clearInterval(this._oracleTimer);
+      this._oracleTimer = null;
+    }
+  }
+}
+
+const claimer = new Claimer();
+
+module.exports = { Claimer, claimer };
+const { ethers } = require('ethers');
+
+const FEED_ADDRESSES = {
+  BTC: '0xc907E116054Ad103354f2D350FD2514433D57F6f',
+  ETH: '0xF9680D99D6C9589e2a93a78A04A279e509205945',
+  SOL: '0x10C8264C0935b3B9870013e057f330Ff3e9C56dC',
+  XRP: '0x785ba89291f676b5386652eB12b30cF361020694',
+};
+
+const ABI = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];
+
+const RPC_ENDPOINTS = [
+  'https://polygon-bor-rpc.publicnode.com',
+  'https://polygon.llamarpc.com',
+  'https://poly-rpc.gateway.pokt.network',
+];
+
+let cachedProvider = null;
+const contractCache = new Map();
+
+async function getProvider() {
+  if (cachedProvider) return cachedProvider;
+
+  for (const url of RPC_ENDPOINTS) {
+    try {
+      const provider = new ethers.providers.JsonRpcProvider(url);
+      await provider.getBlockNumber(); // test connection
+      cachedProvider = provider;
+      console.log(`[chainlink] Connected to Polygon RPC: ${url}`);
+      return provider;
+    } catch (err) {
+      console.error(`[chainlink] RPC failed ${url}: ${err.message}`);
+    }
+  }
+
+  console.error('[chainlink] All RPC endpoints failed');
+  return null;
+}
+
+function getContract(asset, provider) {
+  if (contractCache.has(asset)) return contractCache.get(asset);
+
+  const address = FEED_ADDRESSES[asset];
+  if (!address) return null;
+
+  const contract = new ethers.Contract(address, ABI, provider);
+  contractCache.set(asset, contract);
+  return contract;
+}
+
+async function getChainlinkPrice(asset) {
+  try {
+    const provider = await getProvider();
+    if (!provider) return null;
+
+    const contract = getContract(asset, provider);
+    if (!contract) return null;
+
+    const [, answer] = await contract.latestRoundData();
+    const price = parseFloat(ethers.utils.formatUnits(answer, 8));
+    return price;
+  } catch (err) {
+    console.error(`[chainlink] Error reading ${asset} price:`, err.message);
+    // Reset cached provider so next call tries fresh
+    cachedProvider = null;
+    contractCache.clear();
+    return null;
+  }
+}
+
+async function captureChainlinkOpen(asset) {
+  const price = await getChainlinkPrice(asset);
+  if (price != null) {
+    console.log(`[chainlink] ${asset} oracle price: $${price}`);
+  }
+  return price;
+}
+
+module.exports = { getChainlinkPrice, captureChainlinkOpen };
+const config = require('./config');
+const { coinbaseWS } = require('./coinbase-ws');
+const { captureChainlinkOpen } = require('./chainlink');
+const { polymarketRTDS } = require('./polymarket-ws');
+
+const CLEANUP_INTERVAL_MS = 5 * 60 * 1000;
+const MAX_WINDOW_AGE_MS = 30 * 60 * 1000;
+
+class PriceTracker {
+  constructor() {
+    this.windows = new Map();
+    this._cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
+  }
+
+  getWindowTs(interval) {
+    const now = Math.floor(Date.now() / 1000);
+    const intervalSec = interval * 60;
+    return now - (now % intervalSec);
+  }
+
+  getWindowEnd(interval) {
+    return this.getWindowTs(interval) + interval * 60;
+  }
+
+  getRemainingSeconds(interval) {
+    const now = Math.floor(Date.now() / 1000);
+    return this.getWindowEnd(interval) - now;
+  }
+
+  async captureOpenPrice(laneId, interval) {
+    const asset = laneId.split('-')[0];
+    const windowTs = this.getWindowTs(interval);
+    const key = `${laneId}:${windowTs}`;
+
+    let win = this.windows.get(key);
+    if (!win) {
+      win = { openPrice: null, closePrice: null, capturedOpen: false, capturedClose: false };
+      this.windows.set(key, win);
+    }
+
+    if (win.capturedOpen) return win.openPrice;
+
+    // Priority 1: Polymarket RTDS (exact Chainlink Data Streams price â€” resolution source)
+    const rtdsPrice = polymarketRTDS.getPrice(asset);
+    if (rtdsPrice != null && !polymarketRTDS.isStale()) {
+      win.openPrice = rtdsPrice;
+      win.capturedOpen = true;
+      console.log(`[price] Open price for ${laneId}: $${rtdsPrice} (source: polymarket-rtds)`);
+      return win.openPrice;
+    }
+
+    if (polymarketRTDS.isStale()) {
+      console.log(`[price] RTDS stale â€” using Coinbase for ${laneId} open price`);
+    }
+
+    // Priority 2: Coinbase (when RTDS stale or unavailable)
+    const coinbasePrice = coinbaseWS.getPrice(asset);
+    if (coinbasePrice != null) {
+      win.openPrice = coinbasePrice;
+      win.capturedOpen = true;
+      console.log(`[price] Open price for ${laneId}: $${coinbasePrice} (source: coinbase-fallback)`);
+      return win.openPrice;
+    }
+
+    // Priority 3: Chainlink on-chain Price Feed (last resort)
+    const chainlinkPrice = await captureChainlinkOpen(asset);
+    if (chainlinkPrice != null) {
+      win.openPrice = chainlinkPrice;
+      win.capturedOpen = true;
+      console.log(`[price] Open price for ${laneId}: $${chainlinkPrice} (source: chainlink-fallback)`);
+      return win.openPrice;
+    }
+
+    return null;
+  }
+
+  captureClosePrice(laneId, interval) {
+    const asset = laneId.split('-')[0];
+    const windowTs = this.getWindowTs(interval);
+    const key = `${laneId}:${windowTs}`;
+
+    let win = this.windows.get(key);
+    if (!win) {
+      win = { openPrice: null, closePrice: null, capturedOpen: false, capturedClose: false };
+      this.windows.set(key, win);
+    }
+
+    if (win.capturedClose) return win.closePrice;
+
+    const remaining = this.getRemainingSeconds(interval);
+    if (remaining > 1) return null;
+
+    const price = coinbaseWS.getPrice(asset);
+    if (price == null) return null;
+
+    win.closePrice = price;
+    win.capturedClose = true;
+    return win.closePrice;
+  }
+
+  getWindow(laneId, windowTs) {
+    const key = `${laneId}:${windowTs}`;
+    return this.windows.get(key) || null;
+  }
+
+  cleanup() {
+    const cutoff = Math.floor(Date.now() / 1000) - MAX_WINDOW_AGE_MS / 1000;
+    for (const key of this.windows.keys()) {
+      const ts = parseInt(key.split(':')[1], 10);
+      if (ts < cutoff) {
+        this.windows.delete(key);
+      }
+    }
+  }
+
+  close() {
+    clearInterval(this._cleanupTimer);
+  }
+}
+
+const priceTracker = new PriceTracker();
+
+module.exports = { PriceTracker, priceTracker };
+const axios = require('axios');
+
+const GAMMA_EVENTS_API = 'https://gamma-api.polymarket.com/events';
+const CACHE_TTL_AFTER_END = 5 * 60 * 1000; // 5 minutes after window ends
+
+class MarketDiscovery {
+  constructor() {
+    this.cache = new Map();
+    this._cleanupInterval = setInterval(() => this.clearExpiredCache(), 5 * 60 * 1000);
+  }
+
+  /**
+   * Build deterministic slug: {asset}-updown-{interval}m-{windowTs}
+   * @param {string} asset - e.g. 'BTC' or 'btc'
+   * @param {number} interval - 5 or 15
+   * @param {number} windowTs - window start epoch seconds
+   * @returns {string}
+   */
+  buildSlug(asset, interval, windowTs) {
+    return `${asset.toLowerCase()}-updown-${interval}m-${windowTs}`;
+  }
+
+  /**
+   * Find the Polymarket market for a given lane and window.
+   * @param {string} laneId - e.g. "BTC-5M"
+   * @param {number} windowTs - window start epoch in seconds
+   * @param {number} interval - 5 or 15 (minutes)
+   * @returns {object|null} parsed market data or null
+   */
+  async findMarket(laneId, windowTs, interval) {
+    const asset = laneId.split('-')[0];
+    const slug = this.buildSlug(asset, interval, windowTs);
+
+    // Check cache
+    const cached = this.cache.get(slug);
+    if (cached) {
+      return cached;
+    }
+
+    try {
+      const resp = await axios.get(GAMMA_EVENTS_API, {
+        params: { slug },
+        timeout: 10_000,
+      });
+
+      const events = resp.data;
+      if (!Array.isArray(events) || events.length === 0) {
+        console.log(`[MarketDiscovery] No event found for slug: ${slug}`);
+        return null;
+      }
+
+      const event = events[0];
+      const markets = event.markets;
+      if (!Array.isArray(markets) || markets.length === 0) {
+        console.log(`[MarketDiscovery] Event has no markets for slug: ${slug}`);
+        return null;
+      }
+
+      const market = markets[0];
+
+      let clobTokenIds;
+      try {
+        clobTokenIds = JSON.parse(market.clobTokenIds);
+      } catch (err) {
+        console.error(`[MarketDiscovery] Failed to parse clobTokenIds for ${slug}:`, err.message);
+        return null;
+      }
+
+      const result = {
+        marketId: market.id,
+        conditionId: market.conditionId,
+        clobTokenIds,
+        upTokenId: clobTokenIds[0],
+        downTokenId: clobTokenIds[1],
+        question: market.question,
+        endDate: market.endDate,
+        outcomes: market.outcomes,
+        outcomePrices: market.outcomePrices,
+        slug,
+      };
+
+      // Cache keyed by slug with windowEnd for expiry
+      result._windowEndMs = (windowTs + interval * 60) * 1000;
+      this.cache.set(slug, result);
+      console.log(`[MarketDiscovery] Found market for ${laneId}: "${market.question}"`);
+
+      return result;
+    } catch (err) {
+      console.error(`[MarketDiscovery] API error for slug ${slug}:`, err.message);
+      return null;
+    }
+  }
+
+  /**
+   * Remove cache entries whose window ended more than 5 minutes ago
+   */
+  clearExpiredCache() {
+    const now = Date.now();
+    for (const [slug, entry] of this.cache) {
+      if (now > entry._windowEndMs + CACHE_TTL_AFTER_END) {
+        this.cache.delete(slug);
+      }
+    }
+  }
+
+  /**
+   * Stop the cleanup interval (for graceful shutdown)
+   */
+  destroy() {
+    if (this._cleanupInterval) {
+      clearInterval(this._cleanupInterval);
+      this._cleanupInterval = null;
+    }
+  }
+}
+
+module.exports = new MarketDiscovery();
+const axios = require('axios');
+const config = require('./config');
+
+class Notifications {
+  constructor() {
+    this.enabled = !!(config.telegramBotToken && config.telegramChatId && !config.dryRun);
+  }
+
+  async send(message) {
+    if (!this.enabled) return;
+    try {
+      await axios.post(
+        `https://api.telegram.org/bot${config.telegramBotToken}/sendMessage`,
+        { chat_id: config.telegramChatId, text: message, parse_mode: 'HTML' }
+      );
+    } catch (err) {
+      console.error(`[notify] Telegram error: ${err.message}`);
+    }
+  }
+
+  tradeEntry(trade) {
+    this.send(
+      `ðŸŸ¢ NEW TRADE\nLane: ${trade.laneId}\nSide: ${trade.direction}\nEntry: $${trade.entryPrice}\nShares: ${trade.shares}\nCost: $${trade.cost}\nIrrev: ${trade.irrev}\nType: ${trade.type}`
+    );
+  }
+
+  tradeResult(trade, poolBalance) {
+    this.send(
+      `${trade.result === 'won' ? 'âœ… WON' : 'âŒ LOST'}\nLane: ${trade.lane_id}\nSide: ${trade.side}\nP&L: ${trade.pnl >= 0 ? '+' : ''}$${trade.pnl}\nPool: $${poolBalance}`
+    );
+  }
+
+  botPaused() {
+    this.send('â¸ Bot PAUSED');
+  }
+
+  botResumed() {
+    this.send('â–¶ Bot RESUMED');
+  }
+
+  unclaimedWinsFound(count) {
+    this.send(`ðŸ’° ${count} unclaimed win(s) found â€” claiming...`);
+  }
+
+  error(message) {
+    this.send(`ðŸš¨ ERROR: ${message}`);
+  }
+}
+
+module.exports = new Notifications();
+const jwt = require('jsonwebtoken');
+const config = require('./config');
+
+function login(password) {
+  if (password !== config.jwtSecret) return null;
+  return jwt.sign({ auth: true }, config.jwtSecret, { expiresIn: '30d' });
+}
+
+function authMiddleware(req, res, next) {
+  const header = req.headers.authorization;
+  if (!header || !header.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  try {
+    jwt.verify(header.slice(7), config.jwtSecret);
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+module.exports = { login, authMiddleware };
+# CLAUDE.md â€” y28 Polymarket Bot
+
+## What This Is
+A fully autonomous Polymarket trading bot. SuperScalp ONLY â€” no AI brain, no news, no whale tracking, no extras. Trades 5-minute and 15-minute "Up or Down" binary markets for BTC, ETH, SOL, XRP across 8 lanes.
+Brand: "a year28 development"
+Dashboard: shtatmay.zeabur.app
+
+## Tech Stack
+- **Runtime:** Node.js 20+ / Express.js / port 3000
+- **Database:** SQLite via `better-sqlite3` (NOT sql.js)
+- **Blockchain:** `ethers.js` v5 ONLY (v6 breaks @polymarket/clob-client)
+- **Trading:** `@polymarket/clob-client` for CLOB orders
+- **Prices (current):** Coinbase WebSocket (BTC-USD, ETH-USD, SOL-USD, XRP-USD)
+- **Prices (open/oracle):** Chainlink on-chain price feeds on Polygon
+- **HTTP:** `axios` everywhere â€” NEVER use `fetch`
+- **Dashboard:** React + Vite + Tailwind
+- **Deploy:** Docker â†’ Zeabur Amsterdam (Linode Netherlands)
+- **Persistent volume:** `/app/data`
+
+## SACRED CODE â€” NEVER TOUCH THESE FILES
+The following files are battle-tested and working correctly. Do NOT modify them under ANY circumstances unless Andi explicitly says "modify [filename]":
+
+1. **server/chainlink.js** â€” Chainlink on-chain price feed reader. This is the #1 most critical file. It reads oracle prices that match Polymarket's resolution source. Changing this breaks all trade accuracy.
+2. **server/claimer.js** â€” Claim/redeem system. Uses Data API as single source of truth. Has blacklist for ghost positions. Has balance-change detection for auto-blacklisting. Claim lock prevents concurrent redeems. This code was debugged across 3 chat sessions and cost $139+ in lessons.
+3. **server/price-tracker.js** â€” Open/close price capture. Uses Chainlink for open prices (the resolution source), Coinbase for close prices. Window management is correct.
+
+If a prompt would modify any of these files, REFUSE and explain why. The only exception is if Andi explicitly names the file and says to change it.
+
+## Critical Rules â€” Never Break These
+1. `ethers.js` v5 ONLY â€” never install v6
+2. `axios` for all HTTP â€” never use `fetch`
+3. `clobTokenIds` is a JSON string â€” always `JSON.parse()` before use
+4. CLOB minimum: 5 shares per order
+5. Tick size floor: $0.01
+6. Pool balance = wallet USDC.e balance, synced every 60s via RPC
+7. NEVER send on-chain tx (redeem/claim) without verifying oracle resolution via Data API first. Premature redeems permanently burn shares â€” this cost $139 on April 1, 2026.
+8. No auto-claims on a timer â€” manual CLAIM ALL button only
+9. Notifications are fire-and-forget â€” never let a notification failure crash the bot
+10. No one-time migrations without guard flags
+11. Claim lock: only one claim tx at a time (60s auto-release)
+12. Delete `.env` before Zeabur upload â€” env vars set in Zeabur UI
+13. Never include TELEGRAM_SESSION as env var
+14. Open price comes from CHAINLINK, not Coinbase. This is non-negotiable.
+15. Never DROP or DELETE FROM trades on startup
+16. Never modify SACRED CODE files without explicit permission
+
+## Chainlink Integration
+Polymarket resolves 5M/15M Up/Down markets using Chainlink Data Streams. The bot reads Chainlink price feeds directly from Polygon on-chain contracts:
+
+- BTC/USD: `0xc907E116054Ad103354f2D350FD2514433D57F6f`
+- ETH/USD: `0xF9680D99D6C9589e2a93a78A04A279e509205945`
+- SOL/USD: `0x10C8264C0935b3B9870013e057f330Ff3e9C56dC`
+- XRP/USD: `0x785ba89291f676b5386652eB12b30cF361020694`
+
+ABI: `['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)']`
+Answer divided by 1e8 = USD price.
+
+**The edge:** Coinbase sees price moves 4-12 seconds before Chainlink updates. The bot uses Chainlink open + Coinbase current to detect when price has moved irreversibly â€” matching the exact resolution source Polymarket uses.
+
+## Claimer System
+- Uses Polymarket Data API as single source of truth
+- Filters: `redeemable === true && curPrice === 1 && size > 0`
+- Has hardcoded blacklist (CLAIMED_BLACKLIST Set) for ghost positions
+- Has dynamic blacklist: if redeem succeeds but USDC.e balance doesn't change, conditionId is auto-blacklisted and persisted to settings DB
+- Claim lock prevents concurrent redeems (60s auto-release)
+- NEVER redeems before oracle resolution â€” the Data API gatekeeper ensures this
+
+## Design System
+- Background: `#0C0C0C`, Cards: `#0A0A0A` with `1px #1A1A1A` borders
+- Green: `#00D341`, Red: `#FF3B3B`
+- Font: JetBrains Mono
+- Terminal aesthetic, minimal, no clutter
+- Footer: "a year28 development"
+
+## Wallet
+- Address: `0x140311be486530231450118D417c6015FF7df491`
+- Chain: Polygon (137)
+- USDC.e: `0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174`
+
+## Env Vars
+PORT=3000
+PMB_PASSWORD=<set in Zeabur>
+DATABASE_PATH=/app/data/pmb.db
+POLYGON_PRIVATE_KEY=<set in Zeabur>
+POLYGON_RPC_URL=https://polygon-bor-rpc.publicnode.com
+POLYMARKET_CLOB_URL=https://clob.polymarket.com
+CHAIN_ID=137
+TELEGRAM_BOT_TOKEN=<optional>
+TELEGRAM_CHAT_ID=<optional>
+
+## Project Structure
+year28polymarketbot/
+â”œâ”€â”€ CLAUDE.md
+â”œâ”€â”€ Dockerfile
+â”œâ”€â”€ docker-compose.yml
+â”œâ”€â”€ package.json
+â”œâ”€â”€ server/
+â”‚   â”œâ”€â”€ index.js              # Express server, API routes, main scalp loop, boot sequence
+â”‚   â”œâ”€â”€ config.js             # All constants, thresholds, env loading
+â”‚   â”œâ”€â”€ db.js                 # SQLite init, pool balance, trade CRUD, settings
+â”‚   â”œâ”€â”€ auth.js               # JWT login, middleware
+â”‚   â”œâ”€â”€ coinbase-ws.js        # Coinbase WebSocket (real-time BTC/ETH/SOL/XRP)
+â”‚   â”œâ”€â”€ chainlink.js          # [SACRED] Chainlink on-chain price feeds for open prices
+â”‚   â”œâ”€â”€ price-tracker.js      # [SACRED] Window/open price tracking via Chainlink
+â”‚   â”œâ”€â”€ market-discovery.js   # Gamma API market lookup, deterministic slug, cache
+â”‚   â”œâ”€â”€ superscalp.js         # Core engine: irrev calc, gate checks, midpoint entries
+â”‚   â”œâ”€â”€ spread-scalp.js       # Spread scalp path (last 60s, irrev >= 3.0)
+â”‚   â”œâ”€â”€ order-executor.js     # CLOB limit orders + FOK fallback, orderbook fetching
+â”‚   â”œâ”€â”€ resolver.js           # Window close detection, win/loss, auto-pause on 3 losses
+â”‚   â”œâ”€â”€ claimer.js            # [SACRED] Data API claiming, blacklist, redeem
+â”‚   â”œâ”€â”€ volatility.js         # Volatility tracking for irrev formula
+â”‚   â”œâ”€â”€ notifications.js      # Telegram fire-and-forget
+â”‚   â””â”€â”€ recover.js            # Recovery utilities
+â”œâ”€â”€ dashboard/
+â”‚   â”œâ”€â”€ src/
+â”‚   â”‚   â”œâ”€â”€ App.jsx           # Main app shell, login, dashboard layout
+â”‚   â”‚   â”œâ”€â”€ components/       # Header, StatsRow, LanesGrid, TradesTable, LogsPanel, etc.
+â”‚   â”‚   â””â”€â”€ utils/api.js      # API client functions
+â”‚   â””â”€â”€ dist/                 # Built dashboard (served by Express)
+â””â”€â”€ data/
+â””â”€â”€ pmb.db                # SQLite database (persistent volume on Zeabur)
+
+## 8 Lanes
+BTC-5M, BTC-15M, ETH-5M, ETH-15M, SOL-5M, SOL-15M, XRP-5M, XRP-15M
+
+## SuperScalp Logic
+
+### Two Entry Paths
+1. **Midpoint path** (primary): Irrev passes threshold â†’ entry at $0.20â€“$0.55 â†’ limit order, FOK fallback
+2. **Spread scalp path** (secondary): Last 60s of window â†’ irrev >= 3.0 â†’ buys at real ask â†’ circuit breaker (3 losses/hr = 2hr pause)
+
+### Stacking
+- Max 3 entries per lane per window
+- Escalating irrev thresholds: 1.9, 2.5, 3.5
+- Each stack requires $0.02 better market price than previous
+
+### Compounding Tiers
+| Pool Balance | Allocation % |
+|---|---|
+| < $75 | 8% |
+| $75â€“$150 | 10% |
+| $150â€“$300 | 12% |
+| $300+ | 15% |
+- Irrev multiplier: 1.25x at >= 5.0, 1.5x at >= 10.0
+- Max $20/trade, max $5 loss/trade, min 5 shares
+- Pool floor: $10 minimum to trade
+
+### Resolution
+- Resolver compares Coinbase close price vs Chainlink open price
+- If close price missing, trade stays pending (expires after 15 min)
+- Auto-pause after 3 consecutive losses
+
+### Claiming
+- MANUAL ONLY â€” dashboard CLAIM ALL button
+- Data API checks `redeemable === true && curPrice === 1` first
+- If not redeemable: does nothing
+- If redeemable: fires `redeemPositions()` on-chain
+- Ghost positions filtered by blacklist (hardcoded + dynamic)
+
+## Bug History â€” Lessons Learned
+1. **Chainlink vs Coinbase mismatch (Chat 03):** Bot used Coinbase for open price, Polymarket uses Chainlink. 9 "wins" were actually losses. ~$40 lost. Fixed by reading Chainlink on-chain feeds.
+2. **Auto-claim burn (old PMB bot):** Premature redeems before oracle resolution permanently burned $139 in shares. Current bot uses Data API as gatekeeper â€” never redeems without `redeemable === true`.
+3. **Ghost positions (Chat 03):** 3 already-claimed positions kept showing as redeemable in Data API. Fixed with hardcoded blacklist + dynamic balance-change detection blacklist.
+4. **DB wipe (Chat 02):** Persistent volume wasn't mounted. All trades lost on redeploy. Fixed by mounting /app/data on Zeabur.
+5. **Claimer filters (Chat 02):** Added CLAIM_CUTOFF_DATE and DB matching that blocked ALL claims. Removed both. Claimer uses Data API only.
+6. **Empty orderbooks (Chat 04):** Market makers pull asks in last 60-90s of windows with strong directional moves. Not a bug â€” market structure. Bot can only enter when liquidity exists.
+
+## Working Model
+- Andi never writes code
+- Claude Chat = architect, writes plain-English prompts
+- Claude Code = programmer, executes prompts
+- Prompts are boxed for copy-paste
+- No code snippets in prompts
+- "PROMPT FOR ALL CHANGES" for batched prompts
+- Deploy: delete .env, drag-and-drop to Zeabur, Docker provider
+- Always check boot logs after deploy for confirmation

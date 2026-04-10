@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm init:*)",
+      "Bash(npm install:*)",
+      "Bash(npm create:*)",
+      "Bash(npx --yes create-vite . --template react --overwrite)",
+      "Bash(node -e \"const p = require\\('./node_modules/ethers/package.json'\\); console.log\\('ethers:', p.version\\)\")",
+      "Bash(node -e \"const p = require\\('./node_modules/better-sqlite3/package.json'\\); console.log\\('better-sqlite3:', p.version\\)\")",
+      "Bash(npx vite:*)",
+      "Bash(npx -y acorn --ecma2020 --module --jsx dashboard/src/components/TradesTable.jsx)",
+      "Bash(node -e ':*)",
+      "WebFetch(domain:api.polygonscan.com)",
+      "WebFetch(domain:api.etherscan.io)",
+      "WebFetch(domain:polygon-rpc.com)",
+      "Bash(curl -s -X POST https://polygon-rpc.com -H \"Content-Type: application/json\" -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"0x4b7b2b020399dbc30f96fcb78d98c53a061c424d9d6e57bdc50a524cf90c68\"],\"id\":1}')",
+      "Bash(curl -s -X POST https://rpc.ankr.com/polygon -H \"Content-Type: application/json\" -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"0x4b7b2b020399dbc30f96fcb78d98c53a061c424d9d6e57bdc50a524cf90c68\"],\"id\":1}')",
+      "Bash(curl -s -X POST https://polygon-bor-rpc.publicnode.com -H \"Content-Type: application/json\" -d '{\"jsonrpc\":\"2.0\",\"method\":\"eth_getTransactionReceipt\",\"params\":[\"0x4b7b2b020399dbc30f96fcb78d98c53a061c424d9d6e57bdc50a524cf90c68\"],\"id\":1}')",
+      "Bash(node -c server/chainlink.js)",
+      "Bash(node -c server/price-tracker.js)",
+      "Bash(node -c server/superscalp.js)",
+      "Bash(node -c server/spread-scalp.js)",
+      "Bash(node -c server/market-discovery.js)",
+      "Bash(node -c server/config.js)",
+      "Bash(npm run:*)",
+      "Read(//c/Users/STORM/Desktop/SandBox/01. Year28 Polymarket Bot/**)",
+      "Bash(node -c server/momentum-gate.js)",
+      "Bash(node -c server/coinbase-ws.js)",
+      "Bash(node -c server/index.js)",
+      "Bash(node -c server/order-executor.js)"
+    ]
+  }
+}
