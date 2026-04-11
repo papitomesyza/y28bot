@@ -9,6 +9,9 @@ const DEFAULT_VOLATILITY = {
 
   XRP: 0.80,
   HYPE: 0.90,
+  SOL: 0.75,
+  DOGE: 1.00,
+  BNB: 0.55,
 };
 
 class VolatilityTracker {
@@ -16,6 +19,11 @@ class VolatilityTracker {
     this.ticks = new Map();
     for (const asset of config.assets) {
       this.ticks.set(asset, []);
+    }
+    for (const asset of ['SOL', 'DOGE', 'BNB']) {
+      if (!this.ticks.has(asset)) {
+        this.ticks.set(asset, []);
+      }
     }
   }
 

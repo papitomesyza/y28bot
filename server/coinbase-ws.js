@@ -3,7 +3,9 @@ const config = require('./config');
 const { volatilityTracker } = require('./volatility');
 
 const WS_URL = 'wss://advanced-trade-ws.coinbase.com';
-const PRODUCT_IDS = config.assets.map(a => `${a}-USD`);
+const EXTRA_ASSETS = ['SOL', 'DOGE', 'BNB'];
+const ALL_ASSETS = [...new Set([...config.assets, ...EXTRA_ASSETS])];
+const PRODUCT_IDS = ALL_ASSETS.map(a => `${a}-USD`);
 const RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_ATTEMPTS = 50;
 const LOG_THROTTLE_MS = 30000;
@@ -111,7 +113,7 @@ class CoinbaseWS {
     if (now - this.lastLogTime < LOG_THROTTLE_MS) return;
     this.lastLogTime = now;
 
-    const parts = config.assets
+    const parts = ALL_ASSETS
       .map(a => `${a}=${this.prices[a] != null ? this.prices[a] : '—'}`)
       .join(' ');
     console.log(`[ws] Price update: ${parts}`);

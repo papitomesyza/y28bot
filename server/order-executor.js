@@ -186,7 +186,8 @@ class OrderExecutor {
           const { superScalp } = require('./superscalp');
           const allocation = superScalp.calculateAllocation(poolBalance, signal.irrev);
           const shareCalc = superScalp.calculateShares(allocation, realAsk);
-          if (!shareCalc || shareCalc.shares < config.minShares) {
+          const effectiveMin = signal.minShares || config.minShares;
+          if (!shareCalc || shareCalc.shares < effectiveMin) {
             console.log(`[executor] DRY RUN: real ask $${realAsk} yields insufficient shares for ${signal.laneId}`);
             this._pendingEntries.set(dedupKey, (this._pendingEntries.get(dedupKey) || 1) - 1);
             return null;
@@ -273,8 +274,9 @@ class OrderExecutor {
     }
 
     const shares = Math.floor(shareCalc.shares);
-    if (shares < config.minShares) {
-      console.log(`[executor] Shares ${shares} below minimum ${config.minShares} for ${signal.laneId}`);
+    const effectiveMinShares = signal.minShares || config.minShares;
+    if (shares < effectiveMinShares) {
+      console.log(`[executor] Shares ${shares} below minimum ${effectiveMinShares} for ${signal.laneId}`);
       this._pendingEntries.set(dedupKey, (this._pendingEntries.get(dedupKey) || 1) - 1);
       return null;
     }

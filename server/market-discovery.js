@@ -1,7 +1,18 @@
 const axios = require('axios');
+const { INTERVAL_SLUG } = require('./tier-config');
 
 const GAMMA_EVENTS_API = 'https://gamma-api.polymarket.com/events';
 const CACHE_TTL_AFTER_END = 5 * 60 * 1000; // 5 minutes after window ends
+
+const HOURLY_NAME_MAP = {
+  btc: 'bitcoin',
+  eth: 'ethereum',
+  sol: 'solana',
+  xrp: 'xrp',
+  doge: 'dogecoin',
+  hype: 'hype',
+  bnb: 'bnb',
+};
 
 class MarketDiscovery {
   constructor() {
@@ -10,14 +21,37 @@ class MarketDiscovery {
   }
 
   /**
-   * Build deterministic slug: {asset}-updown-{interval}m-{windowTs}
+   * Build deterministic slug: {asset}-updown-{suffix}-{windowTs}
    * @param {string} asset - e.g. 'BTC' or 'btc'
-   * @param {number} interval - 5 or 15
+   * @param {number} interval - 5, 15, 60, or 240
    * @param {number} windowTs - window start epoch seconds
    * @returns {string}
    */
   buildSlug(asset, interval, windowTs) {
-    return `${asset.toLowerCase()}-updown-${interval}m-${windowTs}`;
+    const assetLower = asset.toLowerCase();
+
+    if (interval === 60) {
+      const fullName = HOURLY_NAME_MAP[assetLower] || assetLower;
+      const fmt = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        month: 'long',
+        day: 'numeric',
+        year: 'numeric',
+        hour: 'numeric',
+        hour12: true,
+      });
+      const parts = fmt.formatToParts(new Date(windowTs * 1000));
+      const get = (type) => parts.find((p) => p.type === type)?.value || '';
+      const month = get('month').toLowerCase();
+      const day = get('day');
+      const year = get('year');
+      const hour = get('hour');
+      const dayPeriod = get('dayPeriod').toLowerCase();
+      return `${fullName}-up-or-down-${month}-${day}-${year}-${hour}${dayPeriod}-et`;
+    }
+
+    const suffix = INTERVAL_SLUG[interval] || interval + 'm';
+    return `${assetLower}-updown-${suffix}-${windowTs}`;
   }
 
   /**
@@ -82,7 +116,7 @@ class MarketDiscovery {
       // Cache keyed by slug with windowEnd for expiry
       result._windowEndMs = (windowTs + interval * 60) * 1000;
       this.cache.set(slug, result);
-      console.log(`[MarketDiscovery] Found market for ${laneId}: "${market.question}"`);
+      console.log(`[MarketDiscovery] Found market for ${laneId} [${slug}]: "${market.question}"`);
 
       return result;
     } catch (err) {

@@ -3,6 +3,7 @@ const { priceTracker } = require('./price-tracker');
 const { coinbaseWS } = require('./coinbase-ws');
 const { getChainlinkPrice } = require('./chainlink');
 const { polymarketRTDS } = require('./polymarket-ws');
+const positionManager = require('./position-manager');
 
 const CLEANUP_AGE_MS = 60 * 60 * 1000; // 1 hour
 const PENDING_CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
@@ -99,6 +100,45 @@ class Resolver {
         });
         console.log(`[resolver] Trade #${trade.id} (${trade.lane_id}) expired — no oracle resolution after ${EXPIRY_AGE_S / 60} min`);
       }
+    }
+
+    // Bridge: resolve candle_positions once all their trades are settled
+    this.resolvePositions();
+  }
+
+  /**
+   * Position resolution bridge.
+   * Checks active candle_positions — if ALL trades for a position are resolved
+   * (won/lost/expired), aggregates the result via positionManager.resolvePosition().
+   */
+  resolvePositions() {
+    try {
+      const activePositions = db.getActivePositions();
+      if (activePositions.length === 0) return;
+
+      for (const pos of activePositions) {
+        // Get all trades linked to this position
+        const trades = db.getTrades({ position_id: pos.id });
+        if (trades.length === 0) continue;
+
+        // Check if all trades are settled (no pending ones left)
+        const hasPending = trades.some(t => t.result === 'pending');
+        if (hasPending) continue;
+
+        // Determine winning side from dominant-side trades (non-hedge)
+        const dominantTrades = trades.filter(t => !t.is_hedge);
+        if (dominantTrades.length === 0) continue;
+
+        // If any dominant trade won, the dominant direction won.
+        // If all dominant trades lost/expired, the opposite direction won.
+        const anyDominantWon = dominantTrades.some(t => t.result === 'won');
+        const wonSide = anyDominantWon ? pos.direction : (pos.direction === 'UP' ? 'DOWN' : 'UP');
+
+        const { result, pnl } = positionManager.resolvePosition(pos.id, wonSide);
+        console.log(`[resolver] Position #${pos.id} (${pos.lane_id}) resolved: ${result} pnl=$${pnl.toFixed(2)}`);
+      }
+    } catch (err) {
+      console.error('[resolver] resolvePositions error:', err.message);
     }
   }
 

@@ -7,12 +7,12 @@ const PING_INTERVAL_MS = 5000;
 const LOG_THROTTLE_MS = 30000;
 const STALE_THRESHOLD_MS = 60000;
 const STALE_CHECK_INTERVAL_MS = 30000;
-const SYMBOL_MAP = { 'btc/usd': 'BTC', 'eth/usd': 'ETH', 'xrp/usd': 'XRP', 'hype/usd': 'HYPE' };
+const SYMBOL_MAP = { 'btc/usd': 'BTC', 'eth/usd': 'ETH', 'xrp/usd': 'XRP', 'hype/usd': 'HYPE', 'sol/usd': 'SOL', 'doge/usd': 'DOGE', 'bnb/usd': 'BNB' };
 
 class PolymarketRTDS {
   constructor() {
     this.ws = null;
-    this.prices = { BTC: null, ETH: null, XRP: null, HYPE: null };
+    this.prices = { BTC: null, ETH: null, XRP: null, HYPE: null, SOL: null, DOGE: null, BNB: null };
     this.connected = false;
     this.reconnectAttempts = 0;
     this.closed = false;

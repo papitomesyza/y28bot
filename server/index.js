@@ -72,6 +72,10 @@ const { claimer } = require('./claimer');
 const notifications = require('./notifications');
 const { polymarketRTDS } = require('./polymarket-ws');
 const { candleEngine } = require('./candle-engine');
+const { TIERS, getTierByInterval, buildV2Lanes } = require('./tier-config');
+const { dcaEngine } = require('./dca-engine');
+const positionManager = require('./position-manager');
+const trendObserver = require('./trend-observer');
 
 // --- Log rotation is size-based (50MB) — see rotateLogFile() above ---
 
@@ -613,6 +617,20 @@ app.get('/api/gate-log', auth.authMiddleware, (req, res) => {
   res.json(rows);
 });
 
+// --- v2 API endpoints (Tier 3/4 DCA) ---
+
+app.get('/api/v2/positions', auth.authMiddleware, (req, res) => {
+  res.json(positionManager.getAllActive());
+});
+
+app.get('/api/v2/lanes', auth.authMiddleware, (req, res) => {
+  res.json(dcaEngine.getAllActiveStates());
+});
+
+app.get('/api/v2/tiers', auth.authMiddleware, (req, res) => {
+  res.json(TIERS);
+});
+
 // --- Static files & client-side routing ---
 
 const dashboardPath = path.join(__dirname, '..', 'dashboard', 'dist');
@@ -736,6 +754,9 @@ app.listen(config.port, () => {
 
   const bootSkipLanes = new Set(config.lanes.map(l => l.id));
   const offHoursLogMap = new Map();
+
+  // --- v2 lanes (Tier 3/4 DCA) ---
+  const v2Lanes = buildV2Lanes().filter(l => l.interval === 60 || l.interval === 240);
 
   setTimeout(() => {
     const balance = db.getPoolBalance();
@@ -861,6 +882,58 @@ app.listen(config.port, () => {
         })();
       }
     }, 1000);
+
+    // --- v2 DCA engine (Tier 3/4) ---
+    const v2LastWindowTs = new Map();
+    const v2BootSkipLanes = new Set(v2Lanes.map(l => l.id));
+
+    const v2Interval = setInterval(() => {
+      for (const lane of v2Lanes) {
+        (async () => {
+          try {
+            const tierConfig = getTierByInterval(lane.interval);
+            const intervalSec = lane.interval * 60;
+            const now = Math.floor(Date.now() / 1000);
+            const currentWindowTs = now - (now % intervalSec);
+            const prevWindowTs = v2LastWindowTs.get(lane.id);
+            const remainingSeconds = (currentWindowTs + intervalSec) - now;
+
+            // Window transition
+            if (prevWindowTs != null && prevWindowTs !== currentWindowTs) {
+              console.log(`[v2] Window transition ${lane.id}: ${prevWindowTs} → ${currentWindowTs}`);
+              dcaEngine.resetLane(lane.id, prevWindowTs);
+              trendObserver.reset(lane.id, prevWindowTs);
+              // Oracle resolver will handle actual resolution via Data API
+              priceTracker.captureOpenPrice(lane.id, lane.interval);
+              v2BootSkipLanes.delete(lane.id);
+            }
+
+            v2LastWindowTs.set(lane.id, currentWindowTs);
+
+            if (global.botPaused) return;
+            if (v2BootSkipLanes.has(lane.id)) return;
+
+            // DCA engine evaluation
+            const signal = await dcaEngine.evaluate(lane.id, tierConfig, currentWindowTs, remainingSeconds);
+            if (signal) {
+              const market = await marketDiscovery.findMarket(signal.laneId, signal.windowTs, lane.interval);
+              if (market) {
+                const trade = await orderExecutor.executeEntry(signal, market);
+                if (trade) {
+                  // Add entry to position
+                  positionManager.addEntry(signal.positionId, trade.entry_price, trade.shares, trade.cost, trade.id, signal.isHedge);
+                  const hedgeTag = signal.isHedge ? ' [HEDGE]' : '';
+                  console.log(`[v2] ${lane.id} ${signal.direction} @ $${trade.entry_price} shares=${trade.shares} tier=${signal.tier}${hedgeTag}`);
+                  notifications.tradeEntry({ laneId: trade.lane_id, direction: trade.side, entryPrice: trade.entry_price, shares: trade.shares, cost: trade.cost, irrev: signal.irrev.toFixed(2), type: signal.type });
+                }
+              }
+            }
+          } catch (err) {
+            console.error(`[v2] Error in lane ${lane.id}:`, err.message);
+          }
+        })();
+      }
+    }, 1000);
   }, 10000);
 
   startupComplete = true;
@@ -871,6 +944,7 @@ app.listen(config.port, () => {
 function shutdown() {
   console.log('[shutdown] Shutting down...');
   if (scalpInterval) clearInterval(scalpInterval);
+  trendObserver.cleanup();
   resolver.close();
   claimer.close();
   polymarketRTDS.close();

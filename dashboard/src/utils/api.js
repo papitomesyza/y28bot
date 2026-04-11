@@ -104,4 +104,14 @@ export async function togglePause(password) {
   return data;
 }
 
+export async function fetchV2Positions() {
+  const { data } = await api.get('/v2/positions');
+  return data;
+}
+
+export async function fetchV2Lanes() {
+  const { data } = await api.get('/v2/lanes');
+  return data;
+}
+
 export default api;

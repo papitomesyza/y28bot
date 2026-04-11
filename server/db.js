@@ -138,9 +138,54 @@ if (!fixFalseWinsV2) {
   console.log('[db] Corrected trades #9 and #10 from won to lost (Chainlink Data Streams resolved opposite direction)');
 }
 
+// --- v2 schema: candle_positions table ---
+db.exec(`
+  CREATE TABLE IF NOT EXISTS candle_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tier INTEGER,
+    lane_id TEXT,
+    window_ts INTEGER,
+    direction TEXT,
+    total_shares REAL DEFAULT 0,
+    total_cost REAL DEFAULT 0,
+    entry_count INTEGER DEFAULT 0,
+    avg_entry_price REAL DEFAULT 0,
+    hedge_shares REAL DEFAULT 0,
+    hedge_cost REAL DEFAULT 0,
+    hedge_entry_count INTEGER DEFAULT 0,
+    net_exposure REAL DEFAULT 0,
+    result TEXT DEFAULT 'active',
+    pnl REAL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(lane_id, window_ts)
+  );
+`);
+
+// Defensive migration: add v2 columns to trades table
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN tier INTEGER');
+  console.log('[db] Added tier column to trades table');
+} catch (_) {
+  // Column already exists — ignore
+}
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN position_id INTEGER');
+  console.log('[db] Added position_id column to trades table');
+} catch (_) {
+  // Column already exists — ignore
+}
+try {
+  db.exec('ALTER TABLE trades ADD COLUMN is_hedge INTEGER DEFAULT 0');
+  console.log('[db] Added is_hedge column to trades table');
+} catch (_) {
+  // Column already exists — ignore
+}
+
 // Log trade count on startup (read-only diagnostic)
 const tradeCount = db.prepare('SELECT COUNT(*) AS cnt FROM trades').get();
 console.log(`[db] Trades table: ${tradeCount.cnt} rows`);
+const posCount = db.prepare('SELECT COUNT(*) AS cnt FROM candle_positions').get();
+console.log(`[db] Candle positions table: ${posCount.cnt} rows`);
 
 function getPoolBalance() {
   return db.prepare('SELECT balance FROM pool WHERE id = 1').get().balance;
@@ -215,6 +260,10 @@ function getTrades(filters = {}) {
     conditions.push('claimed = @claimed');
     params.claimed = filters.claimed;
   }
+  if (filters.position_id !== undefined) {
+    conditions.push('position_id = @position_id');
+    params.position_id = filters.position_id;
+  }
 
   if (conditions.length > 0) {
     sql += ' WHERE ' + conditions.join(' AND ');
@@ -264,6 +313,57 @@ function getLaneReliability(laneId, days) {
   ).all(laneId, cutoff.toISOString().slice(0, 10));
 }
 
+// --- v2 candle_positions CRUD ---
+
+function createPosition(data) {
+  const stmt = db.prepare(`
+    INSERT INTO candle_positions (tier, lane_id, window_ts, direction, total_shares, total_cost, entry_count, avg_entry_price, hedge_shares, hedge_cost, hedge_entry_count, net_exposure, result, pnl)
+    VALUES (@tier, @lane_id, @window_ts, @direction, @total_shares, @total_cost, @entry_count, @avg_entry_price, @hedge_shares, @hedge_cost, @hedge_entry_count, @net_exposure, @result, @pnl)
+  `);
+  const result = stmt.run({
+    tier: data.tier,
+    lane_id: data.lane_id,
+    window_ts: data.window_ts,
+    direction: data.direction,
+    total_shares: data.total_shares || 0,
+    total_cost: data.total_cost || 0,
+    entry_count: data.entry_count || 0,
+    avg_entry_price: data.avg_entry_price || 0,
+    hedge_shares: data.hedge_shares || 0,
+    hedge_cost: data.hedge_cost || 0,
+    hedge_entry_count: data.hedge_entry_count || 0,
+    net_exposure: data.net_exposure || 0,
+    result: data.result || 'active',
+    pnl: data.pnl || null,
+  });
+  return result.lastInsertRowid;
+}
+
+function getPosition(laneId, windowTs) {
+  return db.prepare('SELECT * FROM candle_positions WHERE lane_id = ? AND window_ts = ?').get(laneId, windowTs);
+}
+
+function getPositionById(id) {
+  return db.prepare('SELECT * FROM candle_positions WHERE id = ?').get(id);
+}
+
+function updatePosition(id, updates) {
+  const fields = Object.keys(updates);
+  if (fields.length === 0) return;
+
+  const setClauses = fields.map((f) => `${f} = @${f}`).join(', ');
+  const stmt = db.prepare(`UPDATE candle_positions SET ${setClauses} WHERE id = @id`);
+  stmt.run({ ...updates, id });
+}
+
+function getActivePositions() {
+  return db.prepare("SELECT * FROM candle_positions WHERE result = 'active' ORDER BY created_at DESC").all();
+}
+
+function getPositionsByTier(tier) {
+  return db.prepare('SELECT * FROM candle_positions WHERE tier = ? ORDER BY created_at DESC').all(tier);
+}
+
 module.exports = {
   getPoolBalance,
   updatePoolBalance,
@@ -276,4 +376,10 @@ module.exports = {
   getDb,
   recordLaneResolution,
   getLaneReliability,
+  createPosition,
+  getPosition,
+  getPositionById,
+  updatePosition,
+  getActivePositions,
+  getPositionsByTier,
 };

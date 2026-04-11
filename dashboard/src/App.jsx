@@ -8,6 +8,7 @@ import LanesGrid from './components/LanesGrid.jsx';
 import TradesTable from './components/TradesTable.jsx';
 import CandlesGrid from './components/CandlesGrid.jsx';
 import SettingsSidebar from './components/SettingsSidebar.jsx';
+import V2Positions from './components/V2Positions.jsx';
 
 
 function LoginPage({ onLogin }) {
@@ -59,11 +60,40 @@ function LoginPage({ onLogin }) {
   );
 }
 
+const TABS = [
+  { id: 'dashboard', label: 'Dashboard' },
+  { id: 'v2-dca', label: 'V2 DCA' },
+];
+
+function TabNav({ activeTab, onTabChange }) {
+  return (
+    <div className="flex gap-1" style={{ fontFamily: '"JetBrains Mono", monospace' }}>
+      {TABS.map((tab) => (
+        <button
+          key={tab.id}
+          onClick={() => onTabChange(tab.id)}
+          className="px-3 py-1.5 rounded-full text-xs font-mono transition-colors"
+          style={{
+            background: activeTab === tab.id ? '#00D341' : 'transparent',
+            color: activeTab === tab.id ? '#0C0C0C' : '#888888',
+            border: activeTab === tab.id ? 'none' : '1px solid #1A1A1A',
+            fontWeight: activeTab === tab.id ? 600 : 400,
+            cursor: 'pointer',
+          }}
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function Dashboard() {
   const [status, setStatus] = useState(null);
   const [logs, setLogs] = useState([]);
   const [settings, setSettings] = useState(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState('dashboard');
   const statusInterval = useRef(null);
   const logsInterval = useRef(null);
 
@@ -106,11 +136,17 @@ function Dashboard() {
           onErrorOpen={() => setErrorModalOpen(true)}
           onSettingsOpen={() => setSettingsOpen(true)}
         />
-        <StatsRow status={status} />
-        <CandlesGrid />
-        <LanesGrid status={status} />
-        <TradesTable />
-        <LogsPanel logs={logs} />
+        <TabNav activeTab={activeTab} onTabChange={setActiveTab} />
+        {activeTab === 'dashboard' && (
+          <>
+            <StatsRow status={status} />
+            <CandlesGrid />
+            <LanesGrid status={status} />
+            <TradesTable />
+            <LogsPanel logs={logs} />
+          </>
+        )}
+        {activeTab === 'v2-dca' && <V2Positions />}
       </div>
       <SettingsSidebar
         isOpen={settingsOpen}
