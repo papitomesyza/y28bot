@@ -131,9 +131,12 @@ Rules:
     const cacheKey = `${laneId}:${windowTs}`;
     const confirmKey = `${laneId}:${windowTs}`;
 
-    // Skip if too early in the candle (configurable, default 90s)
-    const minElapsed = 90;
-    if (elapsedSeconds < minElapsed) {
+    // Proportional timing based on interval
+    const totalSeconds = interval * 60;
+    const call1Elapsed = Math.floor(totalSeconds * 0.30);
+    const call2Elapsed = Math.floor(totalSeconds * 0.40);
+
+    if (elapsedSeconds < call1Elapsed) {
       return { approved: false, direction: null, reason: 'too early in candle' };
     }
 
@@ -184,9 +187,10 @@ Rules:
     }
 
     // --- CONFIRMATION PHASE ---
+    const confirmGapMs = (call2Elapsed - call1Elapsed) * 1000;
     const elapsed = Date.now() - confirm.firstCallTime;
-    if (elapsed < 30000) {
-      return { approved: false, direction: confirm.firstDirection, reason: `confirmation in ${Math.ceil((30000 - elapsed) / 1000)}s` };
+    if (elapsed < confirmGapMs) {
+      return { approved: false, direction: confirm.firstDirection, reason: `confirmation in ${Math.ceil((confirmGapMs - elapsed) / 1000)}s` };
     }
 
     // --- SECOND CALL ---

@@ -66,7 +66,6 @@ const { volatilityTracker } = require('./volatility');
 const marketDiscovery = require('./market-discovery');
 const { superScalp } = require('./superscalp');
 const { orderExecutor } = require('./order-executor');
-const { spreadScalp } = require('./spread-scalp');
 const { resolver } = require('./resolver');
 const { claimer } = require('./claimer');
 const notifications = require('./notifications');
@@ -837,7 +836,7 @@ app.listen(config.port, () => {
                   const trade = await orderExecutor.executeEntry(signal, market);
                   if (trade) {
                     console.log(`[trade] Entered ${trade.lane_id} ${trade.side} @ $${trade.entry_price} shares=${trade.shares} irrev=${signal.irrev.toFixed(2)}`);
-                    notifications.tradeEntry({ laneId: trade.lane_id, direction: trade.side, entryPrice: trade.entry_price, shares: trade.shares, cost: trade.cost, irrev: signal.irrev.toFixed(2), type: 'midpoint' });
+                    notifications.tradeEntry({ laneId: trade.lane_id, direction: trade.side, entryPrice: trade.entry_price, shares: trade.shares, cost: trade.cost, irrev: signal.irrev.toFixed(2), type: signal.type });
                     candleEngine.markTradeEntry(trade.lane_id, signal.windowTs, trade.id, trade.entry_price, Date.now());
 
                     const entries = superScalp.activeEntries.get(signal.laneId) || [];
@@ -931,31 +930,47 @@ app.listen(config.port, () => {
             }
 
             const resolvedTokenId = liveDirection === 'UP' ? market.upTokenId : market.downTokenId;
-            const mutableTierConfig = { ...tierConfig, _resolvedTokenId: resolvedTokenId };
+            let mutableTierConfig = { ...tierConfig, _resolvedTokenId: resolvedTokenId };
 
-            // DCA engine evaluation
-            const signal = await dcaEngine.evaluate(lane.id, mutableTierConfig, currentWindowTs, remainingSeconds);
-            if (signal) {
-              // Haiku agent confirmation gate for DCA
-              const { haikuAgent } = require('./haiku-agent');
-              const elapsedSec = (lane.interval * 60) - remainingSeconds;
-              const haikuResult = await haikuAgent.evaluate(lane.id, lane.asset, lane.interval, currentWindowTs, signal.irrev, elapsedSec);
+            // Haiku brain — runs on proportional schedule, caches result
+            const { haikuAgent } = require('./haiku-agent');
+            const elapsedSec = (lane.interval * 60) - remainingSeconds;
+            const haikuResult = await haikuAgent.evaluate(lane.id, lane.asset, lane.interval, currentWindowTs,
+              superScalp.calculateIrrev(lane.asset,
+                priceTracker.getOpenPrice(lane.id, lane.interval) || 0,
+                polymarketRTDS.getPrice(lane.asset) || coinbaseWS.getPrice(lane.asset) || 0,
+                remainingSeconds, lane.interval * 60),
+              elapsedSec);
 
-              if (!haikuResult.approved) {
-                if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in')) {
+            if (!haikuResult.approved) {
+              if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in')) {
+                const logKey = `haiku-v2-${lane.id}`;
+                const now2 = Date.now();
+                const last = (global._v2LogThrottle || (global._v2LogThrottle = new Map())).get(logKey) || 0;
+                if (now2 - last >= 30000) {
+                  global._v2LogThrottle.set(logKey, now2);
                   console.log(`[haiku-gate] ${lane.id} DCA BLOCKED: ${haikuResult.reason}`);
                 }
-                return; // Skip this DCA entry
               }
+              return;
+            }
 
-              // If Haiku returned a direction, override signal direction
+            // Haiku approved — override direction in mutableTierConfig for DCA engine
+            if (haikuResult.direction) {
+              const overrideTokenId = haikuResult.direction === 'UP' ? market.upTokenId : market.downTokenId;
+              mutableTierConfig = { ...mutableTierConfig, _resolvedTokenId: overrideTokenId };
+            }
+
+            // DCA engine evaluation (Haiku already approved, DCA handles timing/sizing)
+            const signal = await dcaEngine.evaluate(lane.id, mutableTierConfig, currentWindowTs, remainingSeconds);
+            if (signal) {
+              // Override signal direction with Haiku's direction
               if (haikuResult.direction) {
                 signal.direction = haikuResult.direction;
               }
 
               const trade = await orderExecutor.executeEntry(signal, market);
               if (trade) {
-                // Add entry to position
                 positionManager.addEntry(signal.positionId, trade.entry_price, trade.shares, trade.cost, trade.id, signal.isHedge);
                 const hedgeTag = signal.isHedge ? ' [HEDGE]' : '';
                 console.log(`[v2] ${lane.id} ${signal.direction} @ $${trade.entry_price} shares=${trade.shares} tier=${signal.tier}${hedgeTag}`);

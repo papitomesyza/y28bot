@@ -157,14 +157,6 @@ class SpreadScalp {
         return null;
       }
 
-      // Enhanced gates check — same as midpoint path
-      const { superScalp } = require('./superscalp');
-      const enhancedResult = await superScalp.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
-      if (!enhancedResult.pass) {
-        console.log(`[spread-scalp] ${laneId} ENHANCED BLOCKED: ${enhancedResult.reason}`);
-        return null;
-      }
-
       // Return signal only — main loop handles execution and recording
       return {
         type: 'spread_scalp',
@@ -203,14 +195,6 @@ class SpreadScalp {
     const expectedProfit = (shares * 1.00) - (shares * askPrice);
     if (expectedProfit < 0.05) {
       console.log(`[spread-scalp] ${laneId} GATE BLOCKED: edge too thin (profit $${expectedProfit.toFixed(2)} at ask $${askPrice.toFixed(2)})`);
-      return null;
-    }
-
-    // Enhanced gates check — same as midpoint path
-    const { superScalp } = require('./superscalp');
-    const enhancedResult = await superScalp.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
-    if (!enhancedResult.pass) {
-      console.log(`[spread-scalp] ${laneId} ENHANCED BLOCKED: ${enhancedResult.reason}`);
       return null;
     }
 

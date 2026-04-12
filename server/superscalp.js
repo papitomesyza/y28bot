@@ -2,7 +2,6 @@ const config = require('./config');
 const { coinbaseWS } = require('./coinbase-ws');
 const { priceTracker } = require('./price-tracker');
 const { volatilityTracker } = require('./volatility');
-const { getChainlinkPrice } = require('./chainlink');
 const { polymarketRTDS } = require('./polymarket-ws');
 const marketDiscovery = require('./market-discovery');
 const db = require('./db');
@@ -12,10 +11,8 @@ const SECONDS_PER_YEAR = 31536000;
 class SuperScalp {
   constructor() {
     this.activeEntries = new Map();
-    this.spreadScalpLosses = [];
     this._lastLogTime = new Map();
     this.peakDeltas = new Map();
-    this._lastEnhancedLogTime = new Map();
   }
 
   // --- Core irreversibility formula ---
@@ -110,184 +107,6 @@ class SuperScalp {
     return rc.irrevStack3 != null ? rc.irrevStack3 : config.irrevThresholds.stack3;
   }
 
-  // FIX 2: Unified minimum irrev threshold — midpoint must match scalp gate minimums
-  getUnifiedMinThreshold(asset, interval) {
-    if (interval === 5) return config.irrevThresholds.base; // 1.2 for 5M
-    // 15M lanes
-    if (asset === 'BTC') return 3.5;
-    return 2.5; // ETH
-  }
-
-  // --- Midpoint gate check ---
-  checkGates(laneId, asset, interval, irrev, entryPrice, remainingSeconds, direction, stackLevel) {
-    const threshold = this.getIrrevThreshold(stackLevel);
-    if (irrev < threshold) {
-      return { pass: false, reason: `irrev ${irrev.toFixed(2)} < threshold ${threshold}` };
-    }
-
-    const entryWindow = config.entryWindows[interval];
-    if (remainingSeconds > entryWindow) {
-      return { pass: false, reason: `remaining ${remainingSeconds}s > entry window ${entryWindow}s` };
-    }
-    if (remainingSeconds <= 10) {
-      return { pass: false, reason: `remaining ${remainingSeconds}s too close to window end` };
-    }
-
-    if (!this.checkVelocity(asset, direction)) {
-      return { pass: false, reason: 'velocity reversing' };
-    }
-
-    if (entryPrice < config.midpointPriceRange.min || entryPrice > config.midpointPriceRange.max) {
-      return { pass: false, reason: `entry price $${entryPrice} outside midpoint range $${config.midpointPriceRange.min}-$${config.midpointPriceRange.max}` };
-    }
-
-    const poolBalance = db.getPoolBalance();
-    if (poolBalance < config.minPoolBalance) {
-      return { pass: false, reason: `pool $${poolBalance.toFixed(2)} < minimum $${config.minPoolBalance}` };
-    }
-
-    const entries = this.activeEntries.get(laneId) || [];
-    if (entries.length >= config.stackMaxEntries) {
-      return { pass: false, reason: `max stacks (${config.stackMaxEntries}) reached` };
-    }
-
-    if (stackLevel > 0 && entries.length > 0) {
-      const lastEntry = entries[entries.length - 1];
-      if (entryPrice > lastEntry.entryPrice - config.stackPriceImprovement) {
-        return { pass: false, reason: `entry $${entryPrice} not $${config.stackPriceImprovement} better than prev $${lastEntry.entryPrice}` };
-      }
-    }
-
-    const allocation = this.calculateAllocation(poolBalance, irrev);
-    const shareCalc = this.calculateShares(allocation, entryPrice);
-    if (!shareCalc) {
-      return { pass: false, reason: 'insufficient shares (below min or exceeds loss cap)' };
-    }
-
-    return { pass: true, reason: 'all gates passed' };
-  }
-
-  // --- Spread scalp gate check ---
-  checkSpreadScalpGates(laneId, asset, interval, irrev, askPrice, remainingSeconds) {
-    if (irrev < config.spreadScalpIrrev) {
-      return { pass: false, reason: `irrev ${irrev.toFixed(2)} < spread scalp threshold ${config.spreadScalpIrrev}` };
-    }
-
-    if (remainingSeconds > config.spreadScalpLastSeconds) {
-      return { pass: false, reason: `remaining ${remainingSeconds}s > last ${config.spreadScalpLastSeconds}s window` };
-    }
-
-    if (askPrice < config.spreadScalpPriceRange.min || askPrice > config.spreadScalpPriceRange.max) {
-      return { pass: false, reason: `ask price $${askPrice} outside range $${config.spreadScalpPriceRange.min}-$${config.spreadScalpPriceRange.max}` };
-    }
-
-    const poolBalance = db.getPoolBalance();
-    if (poolBalance < config.minPoolBalance) {
-      return { pass: false, reason: `pool $${poolBalance.toFixed(2)} < minimum $${config.minPoolBalance}` };
-    }
-
-    // Circuit breaker check
-    const cb = config.spreadScalpCircuitBreaker;
-    const oneHourAgo = Date.now() - cb.windowHours * 60 * 60 * 1000;
-    const recentLosses = this.spreadScalpLosses.filter(ts => ts >= oneHourAgo);
-    if (recentLosses.length >= cb.maxLosses) {
-      const lastLoss = Math.max(...recentLosses);
-      const pauseEnd = lastLoss + cb.pauseHours * 60 * 60 * 1000;
-      if (Date.now() < pauseEnd) {
-        const remainPause = Math.ceil((pauseEnd - Date.now()) / 1000 / 60);
-        return { pass: false, reason: `circuit breaker: ${recentLosses.length} losses in 1hr, paused ${remainPause}min` };
-      }
-    }
-
-    return { pass: true, reason: 'all spread scalp gates passed' };
-  }
-
-  // --- Enhanced multi-layer gate filter ---
-  async checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs) {
-    const gates = config.enhancedGates;
-    const peakKey = `${laneId}-${windowTs}`;
-
-    // Update peak delta tracking (Layer 6)
-    const currentDelta = Math.abs(currentPrice - openPrice);
-    const prevPeak = this.peakDeltas.get(peakKey) || 0;
-    if (currentDelta > prevPeak) {
-      this.peakDeltas.set(peakKey, currentDelta);
-    }
-    const peakDelta = this.peakDeltas.get(peakKey);
-
-    // Throttle enhanced gate logs (10s per lane)
-    const now = Date.now();
-    const logKey = `enhanced-${laneId}`;
-    const lastEnhLog = this._lastEnhancedLogTime.get(logKey) || 0;
-    const shouldLog = now - lastEnhLog >= 10000;
-    if (shouldLog) this._lastEnhancedLogTime.set(logKey, now);
-
-    // LAYER 7 — Time-Scaled Minimum Delta Filter (HARD GATE)
-    const delta = Math.abs(currentPrice - openPrice);
-    const baseDelta = gates.minDelta[asset];
-    const remainingSeconds = priceTracker.getRemainingSeconds(interval);
-    let timeMultiplier = 1.0;
-    if (remainingSeconds <= 10) timeMultiplier = 1.5;
-    else if (remainingSeconds <= 30) timeMultiplier = 1.4;
-    else if (remainingSeconds <= 60) timeMultiplier = 1.3;
-    else if (remainingSeconds <= 120) timeMultiplier = 1.2;
-    const scaledDelta = baseDelta * timeMultiplier;
-    if (delta < scaledDelta) {
-      if (shouldLog) console.log(`[enhanced] ${laneId} KILLED: delta $${delta.toFixed(4)} < scaled min $${scaledDelta.toFixed(4)} (base=$${baseDelta} x${timeMultiplier} at ${remainingSeconds}s remaining)`);
-      return { pass: false, reason: 'enhanced L7: delta too small' };
-    }
-
-    // LAYER 6 — No-Reversal Check (HARD GATE)
-    if (peakDelta > 0) {
-      const retracement = 1 - (currentDelta / peakDelta);
-      if (retracement > gates.maxRetracement) {
-        if (shouldLog) console.log(`[enhanced] ${laneId} KILLED: retracement ${(retracement * 100).toFixed(1)}% > max ${gates.maxRetracement * 100}%`);
-        return { pass: false, reason: 'enhanced L6: retracement too high' };
-      }
-    }
-
-    // LAYER 2 — Chainlink Non-Contradiction (HARD GATE)
-    let chainlinkDirection = 'neutral';
-    let chainlinkDelta = 0;
-    try {
-      let currentChainlinkPrice = polymarketRTDS.getPrice(asset);
-      if (currentChainlinkPrice == null) {
-        currentChainlinkPrice = await getChainlinkPrice(asset);
-      }
-      if (currentChainlinkPrice != null) {
-        chainlinkDelta = currentChainlinkPrice - openPrice;
-        if (Math.abs(chainlinkDelta) <= gates.chainlinkNoise[asset]) {
-          chainlinkDirection = 'neutral';
-        } else {
-          chainlinkDirection = chainlinkDelta > 0 ? 'UP' : 'DOWN';
-        }
-      }
-    } catch (_) {
-      // RPC failure → pass (don't block on RPC errors)
-      chainlinkDirection = 'neutral';
-    }
-
-    if (chainlinkDirection !== 'neutral' && chainlinkDirection !== direction) {
-      console.log(`[enhanced] ${laneId} KILLED: Chainlink contradicts (signal=${direction}, chainlink=${chainlinkDirection}, delta=$${chainlinkDelta.toFixed(4)})`);
-      return { pass: false, reason: 'enhanced L2: Chainlink contradicts' };
-    }
-
-    // LAYER 3 — Chainlink Delta Ratio (HARD GATE, only when Chainlink not neutral)
-    if (chainlinkDirection !== 'neutral') {
-      const coinbaseDelta = Math.abs(currentPrice - openPrice);
-      const chainlinkAbsDelta = Math.abs(chainlinkDelta);
-      if (coinbaseDelta > 0) {
-        const ratio = chainlinkAbsDelta / coinbaseDelta;
-        if (ratio < gates.chainlinkDeltaRatio) {
-          console.log(`[enhanced] ${laneId} KILLED: Chainlink ratio too low (${(ratio * 100).toFixed(1)}% < ${gates.chainlinkDeltaRatio * 100}%)`);
-          return { pass: false, reason: 'enhanced L3: Chainlink ratio too low' };
-        }
-      }
-    }
-
-    return { pass: true, reason: 'all enhanced gates passed' };
-  }
-
   // --- Main evaluation loop (called every second per lane) ---
   async evaluate(laneId) {
     const parts = laneId.split('-');
@@ -351,152 +170,97 @@ class SuperScalp {
       console.log(`[scalp] ${laneId} irrev=${irrev.toFixed(2)} dir=${direction} remaining=${remainingSeconds}s open=$${openPrice}`);
     }
 
-    // Midpoint path — fetch real orderbook price when available
-    const stackLevel = this.getStackLevel(laneId);
+    // === HAIKU BRAIN — primary decision maker ===
+    const { haikuAgent } = require('./haiku-agent');
+    const elapsedSec = totalSeconds - remainingSeconds;
+    const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, irrev, elapsedSec);
+
+    if (!haikuResult.approved) {
+      // Only log non-spammy reasons
+      if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in')) {
+        const logKey = `haiku-${laneId}`;
+        const lastHaikuLog = this._lastLogTime.get(logKey) || 0;
+        if (now - lastHaikuLog >= 10000) {
+          this._lastLogTime.set(logKey, now);
+          console.log(`[haiku-gate] ${laneId} BLOCKED: ${haikuResult.reason}`);
+        }
+      }
+      return null;
+    }
+
+    // Haiku approved — use Haiku's direction
+    const finalDirection = haikuResult.direction || direction;
+
+    // === MINIMAL SAFETY GATES (no legacy gates) ===
+
+    // 10s end-of-window cutoff
+    if (remainingSeconds <= 10) {
+      return null;
+    }
+
+    // Find market for orderbook lookup
+    if (!market) {
+      return null;
+    }
+
+    // Get real orderbook ask price
     const { orderExecutor } = require('./order-executor');
-    let entryPrice = 0.50; // fallback placeholder
-
-    // Attempt real orderbook price for midpoint
-    let midpointUsedRealPrice = false;
-    if (orderExecutor.initialized && orderExecutor.client && market) {
+    const tokenId = finalDirection === 'UP' ? market.upTokenId : market.downTokenId;
+    let askPrice = null;
+    if (orderExecutor.initialized && orderExecutor.client) {
       try {
-        const tokenId = direction === 'UP' ? market.upTokenId : market.downTokenId;
-        const realAsk = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
-        if (realAsk !== null) {
-          entryPrice = realAsk;
-          midpointUsedRealPrice = true;
-        }
-      } catch (_) {
-        // Fall back to placeholder
+        askPrice = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
+      } catch (_) {}
+    }
+    if (askPrice == null) {
+      return null;
+    }
+
+    // maxAskPrice cap
+    const maxAsk = (global.runtimeConfig && global.runtimeConfig.maxAskPrice) || 0.85;
+    if (askPrice >= maxAsk) {
+      const logKey = `ask-cap-${laneId}`;
+      const lastCapLog = this._lastLogTime.get(logKey) || 0;
+      if (now - lastCapLog >= 10000) {
+        this._lastLogTime.set(logKey, now);
+        console.log(`[scalp] ${laneId} ASK_CAP: $${askPrice} >= $${maxAsk}`);
       }
+      return null;
     }
 
-    // If real ask exceeds midpoint range, skip midpoint path
-    let midpointCheck = { pass: false, reason: 'real ask outside midpoint range' };
-    if (entryPrice <= config.midpointPriceRange.max) {
-      midpointCheck = this.checkGates(laneId, asset, interval, irrev, entryPrice, remainingSeconds, direction, stackLevel);
+    // Pool balance minimum
+    const poolBalance = db.getPoolBalance();
+    if (poolBalance < config.minPoolBalance) {
+      return null;
     }
 
-    // FIX 2: Unified minimum irrev threshold for midpoint path
-    if (midpointCheck.pass) {
-      const unifiedThreshold = this.getUnifiedMinThreshold(asset, interval);
-      if (irrev < unifiedThreshold) {
-        console.log(`[signal] midpoint ${laneId} irrev=${irrev.toFixed(2)} BLOCKED: below threshold ${unifiedThreshold}`);
-        midpointCheck = { pass: false, reason: `irrev below unified threshold ${unifiedThreshold}` };
-      }
+    // Dedup: max entries per window
+    const entries = this.activeEntries.get(laneId) || [];
+    if (entries.length >= config.stackMaxEntries) {
+      return null;
     }
 
-    if (midpointCheck.pass) {
-      const poolBalance = db.getPoolBalance();
-      const allocation = this.calculateAllocation(poolBalance, irrev);
-      const shareCalc = this.calculateShares(allocation, entryPrice);
-      if (shareCalc) {
-        // Minimum edge gate: expected profit must be >= $0.10
-        const expectedProfit = (shareCalc.shares * 1.00) - (shareCalc.shares * entryPrice);
-        if (expectedProfit < 0.10) {
-          console.log(`[scalp] ${laneId} GATE BLOCKED: edge too thin (profit $${expectedProfit.toFixed(2)} at ask $${entryPrice.toFixed(2)})`);
-        } else {
-          const enhancedResult = await this.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
-          if (!enhancedResult.pass) {
-            // Already logged inside checkEnhancedGates
-          } else {
-            // Haiku agent confirmation gate
-            const { haikuAgent } = require('./haiku-agent');
-            const elapsedSec = (interval * 60) - remainingSeconds;
-            const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, irrev, elapsedSec);
-
-            if (haikuResult.approved) {
-              // If Haiku returned a direction, use it instead of the irrev-based direction
-              const finalDirection = haikuResult.direction || direction;
-              return {
-                type: 'midpoint',
-                laneId,
-                asset,
-                direction: finalDirection,
-                irrev,
-                entryPrice,
-                allocation,
-                shares: shareCalc.shares,
-                cost: shareCalc.cost,
-                windowTs,
-              };
-            } else {
-              const now = Date.now();
-              const logKey = `haiku-mid-${laneId}`;
-              const lastLog = this._lastLogTime.get(logKey) || 0;
-              if (now - lastLog >= 10000) {
-                this._lastLogTime.set(logKey, now);
-                console.log(`[haiku-gate] ${laneId} midpoint BLOCKED: ${haikuResult.reason}`);
-              }
-            }
-          }
-        }
-      }
+    // Calculate allocation and shares
+    const allocation = this.calculateAllocation(poolBalance, irrev);
+    const shareCalc = this.calculateShares(allocation, askPrice);
+    if (!shareCalc) {
+      return null;
     }
 
-    // Spread scalp path — fetch real orderbook price when available
-    let askPrice = 0.95; // fallback placeholder
-    if (orderExecutor.initialized && orderExecutor.client && market) {
-      try {
-        const tokenId = direction === 'UP' ? market.upTokenId : market.downTokenId;
-        const realAsk = await orderExecutor.getOrderbookPrice(tokenId, 'buy');
-        if (realAsk !== null) {
-          askPrice = realAsk;
-        }
-      } catch (_) {
-        // Fall back to placeholder
-      }
-    }
+    console.log(`[scalp] ${laneId} HAIKU APPROVED: ${finalDirection} irrev=${irrev.toFixed(2)} ask=$${askPrice}`);
 
-    const spreadCheck = this.checkSpreadScalpGates(laneId, asset, interval, irrev, askPrice, remainingSeconds);
-    if (spreadCheck.pass) {
-      const poolBalance = db.getPoolBalance();
-      const allocation = this.calculateAllocation(poolBalance, irrev);
-      const shareCalc = this.calculateShares(allocation, askPrice);
-      if (shareCalc) {
-        const enhancedResult = await this.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
-        if (enhancedResult.pass) {
-          // Haiku agent confirmation gate
-          const { haikuAgent } = require('./haiku-agent');
-          const elapsedSec = (interval * 60) - remainingSeconds;
-          const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, irrev, elapsedSec);
-
-          if (haikuResult.approved) {
-            const finalDirection = haikuResult.direction || direction;
-            return {
-              type: 'spread_scalp',
-              laneId,
-              asset,
-              direction: finalDirection,
-              irrev,
-              askPrice,
-              allocation,
-              shares: shareCalc.shares,
-              cost: shareCalc.cost,
-              windowTs,
-            };
-          } else {
-            const now = Date.now();
-            const logKey = `haiku-ss-${laneId}`;
-            const lastLog = this._lastLogTime.get(logKey) || 0;
-            if (now - lastLog >= 10000) {
-              this._lastLogTime.set(logKey, now);
-              console.log(`[haiku-gate] ${laneId} spread scalp BLOCKED: ${haikuResult.reason}`);
-            }
-          }
-        }
-      }
-    }
-
-    // Log gate rejections when irrev is notable (>=1.5) to aid debugging
-    if (irrev >= 1.5) {
-      const reasons = [];
-      if (!midpointCheck.pass) reasons.push(`midpoint: ${midpointCheck.reason}`);
-      if (!spreadCheck.pass) reasons.push(`spread: ${spreadCheck.reason}`);
-      console.log(`[scalp] ${laneId} irrev=${irrev.toFixed(2)} GATE BLOCKED: ${reasons.join(' | ')}`);
-    }
-
-    return null;
+    return {
+      type: 'haiku_scalp',
+      laneId,
+      asset,
+      direction: finalDirection,
+      irrev,
+      entryPrice: askPrice,
+      allocation,
+      shares: shareCalc.shares,
+      cost: shareCalc.cost,
+      windowTs,
+    };
   }
 
   // --- Reset lane entries for new window ---
