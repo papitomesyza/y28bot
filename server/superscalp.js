@@ -235,8 +235,8 @@ class SuperScalp {
     }
 
     // Dedup: max entries per window
-    const entries = this.activeEntries.get(laneId) || [];
-    if (entries.length >= config.stackMaxEntries) {
+    const currentEntries = this.activeEntries.get(laneId) || [];
+    if (currentEntries.length >= config.stackMaxEntries) {
       return null;
     }
 
