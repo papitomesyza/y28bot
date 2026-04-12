@@ -490,18 +490,35 @@ class SuperScalp {
           if (!enhancedResult.pass) {
             // Already logged inside checkEnhancedGates
           } else {
-            return {
-              type: 'midpoint',
-              laneId,
-              asset,
-              direction,
-              irrev,
-              entryPrice,
-              allocation,
-              shares: shareCalc.shares,
-              cost: shareCalc.cost,
-              windowTs,
-            };
+            // Haiku agent confirmation gate
+            const { haikuAgent } = require('./haiku-agent');
+            const elapsedSec = (interval * 60) - remainingSeconds;
+            const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, irrev, elapsedSec);
+
+            if (haikuResult.approved) {
+              // If Haiku returned a direction, use it instead of the irrev-based direction
+              const finalDirection = haikuResult.direction || direction;
+              return {
+                type: 'midpoint',
+                laneId,
+                asset,
+                direction: finalDirection,
+                irrev,
+                entryPrice,
+                allocation,
+                shares: shareCalc.shares,
+                cost: shareCalc.cost,
+                windowTs,
+              };
+            } else {
+              const now = Date.now();
+              const logKey = `haiku-mid-${laneId}`;
+              const lastLog = this._lastLogTime.get(logKey) || 0;
+              if (now - lastLog >= 10000) {
+                this._lastLogTime.set(logKey, now);
+                console.log(`[haiku-gate] ${laneId} midpoint BLOCKED: ${haikuResult.reason}`);
+              }
+            }
           }
         }
       }
@@ -529,18 +546,34 @@ class SuperScalp {
       if (shareCalc) {
         const enhancedResult = await this.checkEnhancedGates(laneId, asset, interval, direction, openPrice, currentPrice, windowTs);
         if (enhancedResult.pass) {
-          return {
-            type: 'spread_scalp',
-            laneId,
-            asset,
-            direction,
-            irrev,
-            askPrice,
-            allocation,
-            shares: shareCalc.shares,
-            cost: shareCalc.cost,
-            windowTs,
-          };
+          // Haiku agent confirmation gate
+          const { haikuAgent } = require('./haiku-agent');
+          const elapsedSec = (interval * 60) - remainingSeconds;
+          const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, irrev, elapsedSec);
+
+          if (haikuResult.approved) {
+            const finalDirection = haikuResult.direction || direction;
+            return {
+              type: 'spread_scalp',
+              laneId,
+              asset,
+              direction: finalDirection,
+              irrev,
+              askPrice,
+              allocation,
+              shares: shareCalc.shares,
+              cost: shareCalc.cost,
+              windowTs,
+            };
+          } else {
+            const now = Date.now();
+            const logKey = `haiku-ss-${laneId}`;
+            const lastLog = this._lastLogTime.get(logKey) || 0;
+            if (now - lastLog >= 10000) {
+              this._lastLogTime.set(logKey, now);
+              console.log(`[haiku-gate] ${laneId} spread scalp BLOCKED: ${haikuResult.reason}`);
+            }
+          }
         }
       }
     }

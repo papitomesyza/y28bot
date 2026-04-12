@@ -7,11 +7,6 @@ const CACHE_TTL_AFTER_END = 5 * 60 * 1000; // 5 minutes after window ends
 const HOURLY_NAME_MAP = {
   btc: 'bitcoin',
   eth: 'ethereum',
-  sol: 'solana',
-  xrp: 'xrp',
-  doge: 'dogecoin',
-  hype: 'hype',
-  bnb: 'bnb',
 };
 
 class MarketDiscovery {
@@ -79,6 +74,43 @@ class MarketDiscovery {
 
       const events = resp.data;
       if (!Array.isArray(events) || events.length === 0) {
+        // Fallback for hourly+ intervals: try timestamp-based slug
+        if (interval >= 60) {
+          const suffix = INTERVAL_SLUG[interval] || interval + 'm';
+          const fallbackSlug = `${asset.toLowerCase()}-updown-${suffix}-${windowTs}`;
+          console.log(`[MarketDiscovery] Primary slug failed, trying fallback: ${fallbackSlug}`);
+          try {
+            const resp2 = await axios.get(GAMMA_EVENTS_API, { params: { slug: fallbackSlug }, timeout: 10000 });
+            const events2 = resp2.data;
+            if (Array.isArray(events2) && events2.length > 0) {
+              const event2 = events2[0];
+              const markets2 = event2.markets;
+              if (Array.isArray(markets2) && markets2.length > 0) {
+                const market2 = markets2[0];
+                let clobTokenIds2;
+                try { clobTokenIds2 = JSON.parse(market2.clobTokenIds); } catch { return null; }
+                const result2 = {
+                  marketId: market2.id,
+                  conditionId: market2.conditionId,
+                  clobTokenIds: clobTokenIds2,
+                  upTokenId: clobTokenIds2[0],
+                  downTokenId: clobTokenIds2[1],
+                  question: market2.question,
+                  endDate: market2.endDate,
+                  outcomes: market2.outcomes,
+                  outcomePrices: market2.outcomePrices,
+                  slug: fallbackSlug,
+                  _windowEndMs: (windowTs + interval * 60) * 1000,
+                };
+                this.cache.set(fallbackSlug, result2);
+                console.log(`[MarketDiscovery] Found market via fallback slug for ${laneId}: "${market2.question}"`);
+                return result2;
+              }
+            }
+          } catch (err2) {
+            console.error(`[MarketDiscovery] Fallback slug error for ${laneId}:`, err2.message);
+          }
+        }
         console.log(`[MarketDiscovery] No event found for slug: ${slug}`);
         return null;
       }

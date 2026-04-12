@@ -200,28 +200,6 @@ class MomentumGate {
       return { allowed: true, reason: 'DOWN always allowed', indicators: { vwap: 'n/a', ema: 'n/a', rsi: 0, vote: 'pass' } };
     }
 
-    // XRP, HYPE — no reliable candle data, use BTC as proxy gate
-    if (!SUPPORTED_COINS.includes(asset)) {
-      const btcState = this.state['BTC'];
-      if (!btcState || !btcState.initialized) {
-        return { allowed: true, reason: 'BTC proxy not initialized', indicators: { vwap: 'n/a', ema: 'n/a', rsi: 0, vote: 'pass', proxy: true } };
-      }
-      // Delegate to BTC's gate check, passing through laneId for DB logging
-      const btcResult = this.isDirectionAllowed('BTC', direction, laneId);
-      if (!btcResult.allowed) {
-        btcResult.reason = `bearish regime via BTC proxy (VWAP: ${btcResult.indicators.vwap}, EMA: ${btcResult.indicators.ema}, RSI: ${btcResult.indicators.rsi})`;
-        btcResult.indicators.proxy = true;
-      } else {
-        btcResult.indicators.proxy = true;
-        if (btcResult.reason === 'trend aligned or neutral') {
-          btcResult.reason = 'allowed via BTC proxy (neutral/bullish)';
-        } else {
-          btcResult.reason = `allowed via BTC proxy (${btcResult.reason})`;
-        }
-      }
-      return btcResult;
-    }
-
     const s = this.state[asset];
     if (!s.initialized) {
       return { allowed: true, reason: 'gate not initialized', indicators: { vwap: 'n/a', ema: 'n/a', rsi: 0, vote: 'pass' } };
@@ -343,28 +321,6 @@ class MomentumGate {
         vote: this._getVote(coin),
         blockedCount: s.blockedCount,
         initialized: s.initialized,
-      };
-    }
-
-    // XRP and HYPE — use BTC as proxy
-    const btcData = result['BTC'];
-    for (const coin of ['XRP', 'HYPE']) {
-      let currentPrice = null;
-      try {
-        const { coinbaseWS } = require('./coinbase-ws');
-        currentPrice = coinbaseWS.getPrice(coin);
-      } catch (_) {}
-
-      result[coin] = {
-        ema9: btcData ? btcData.ema9 : null,
-        ema21: btcData ? btcData.ema21 : null,
-        rsi: btcData ? btcData.rsi : null,
-        vwap: btcData ? btcData.vwap : null,
-        currentPrice,
-        vote: btcData ? btcData.vote : 'no data',
-        blockedCount: btcData ? btcData.blockedCount : 0,
-        initialized: btcData ? btcData.initialized : false,
-        proxy: true,
       };
     }
 

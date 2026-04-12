@@ -103,6 +103,14 @@ class PriceTracker {
     return this.windows.get(key) || null;
   }
 
+  getOpenPrice(laneId, interval) {
+    const windowTs = this.getWindowTs(interval);
+    const key = `${laneId}:${windowTs}`;
+    const win = this.windows.get(key);
+    if (win && win.capturedOpen && win.openPrice != null) return win.openPrice;
+    return null;
+  }
+
   cleanup() {
     const cutoff = Math.floor(Date.now() / 1000) - MAX_WINDOW_AGE_MS / 1000;
     for (const key of this.windows.keys()) {

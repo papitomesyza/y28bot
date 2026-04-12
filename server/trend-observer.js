@@ -46,7 +46,7 @@ class TrendObserver {
    * Evaluate whether observation is complete and whether a go signal exists.
    * Returns { goSignal, direction, trendStrength }.
    */
-  evaluate(laneId, windowTs, tierConfig) {
+  evaluate(laneId, windowTs, tierConfig, irrev) {
     const key = this._key(laneId, windowTs);
     const state = this.observations.get(key);
 
@@ -71,6 +71,11 @@ class TrendObserver {
 
     // Observation period complete — analyze
     const result = this._analyze(state);
+
+    // Strong-move override: irrev >= 1.5 bypasses trend threshold
+    if (irrev != null && irrev >= 1.5 && result.direction) {
+      result.goSignal = true;
+    }
 
     // Cache result
     state.observationComplete = true;
@@ -139,7 +144,7 @@ class TrendObserver {
     const lastAvg = bucketAvgs[bucketAvgs.length - 1];
     const direction = lastAvg > state.openPrice ? 'UP' : 'DOWN';
 
-    const goSignal = trendStrength >= 0.6;
+    const goSignal = trendStrength >= 0.4;
 
     return { goSignal, direction, trendStrength };
   }

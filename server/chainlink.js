@@ -3,8 +3,6 @@ const { ethers } = require('ethers');
 const FEED_ADDRESSES = {
   BTC: '0xc907E116054Ad103354f2D350FD2514433D57F6f',
   ETH: '0xF9680D99D6C9589e2a93a78A04A279e509205945',
-
-  XRP: '0x785ba89291f676b5386652eB12b30cF361020694',
 };
 
 const ABI = ['function latestRoundData() view returns (uint80,int256,uint256,uint256,uint80)'];

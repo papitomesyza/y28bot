@@ -10,7 +10,7 @@ function deepFreeze(obj) {
   return obj;
 }
 
-const assets = ['BTC', 'ETH', 'XRP', 'HYPE'];
+const assets = ['BTC', 'ETH'];
 const intervals = [5, 15];
 
 const lanes = [];
@@ -63,9 +63,6 @@ const config = deepFreeze({
     chainlinkNoise: {
       BTC: 2,
       ETH: 0.10,
-
-      XRP: 0.0002,
-      HYPE: 0.05,
     },
     // Layer 3: Chainlink delta ratio (only when Chainlink has moved beyond noise)
     chainlinkDeltaRatio: 0.30,
@@ -75,9 +72,6 @@ const config = deepFreeze({
     minDelta: {
       BTC: 8,
       ETH: 0.40,
-
-      XRP: 0.0015,
-      HYPE: 0.15,
     },
     // Layer 5: Cross-asset minimum irrev to count as confirming
     crossAssetMinIrrev: 0.3,
@@ -88,6 +82,7 @@ const config = deepFreeze({
   stackPriceImprovement: 0.02,
   limitOrderTimeoutMs: 5000,
   dryRun: false,
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY || null,
 });
 
 module.exports = config;

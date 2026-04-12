@@ -3,8 +3,7 @@ const config = require('./config');
 const { volatilityTracker } = require('./volatility');
 
 const WS_URL = 'wss://advanced-trade-ws.coinbase.com';
-const EXTRA_ASSETS = ['SOL', 'DOGE', 'BNB'];
-const ALL_ASSETS = [...new Set([...config.assets, ...EXTRA_ASSETS])];
+const ALL_ASSETS = config.assets;
 const PRODUCT_IDS = ALL_ASSETS.map(a => `${a}-USD`);
 const RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_ATTEMPTS = 50;

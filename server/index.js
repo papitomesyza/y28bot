@@ -458,6 +458,12 @@ app.get('/api/status', auth.authMiddleware, (req, res) => {
   const yesterdayPoolRaw = db.getSetting('yesterdayPoolBalance');
   const yesterdayPool = yesterdayPoolRaw != null ? parseFloat(yesterdayPoolRaw) : null;
 
+  let haikuAgentState = { error: 'not loaded' };
+  try {
+    const { haikuAgent } = require('./haiku-agent');
+    haikuAgentState = haikuAgent.getState();
+  } catch (_) {}
+
   res.json({
     pool,
     yesterdayPool,
@@ -467,6 +473,7 @@ app.get('/api/status', auth.authMiddleware, (req, res) => {
     prices: coinbaseWS.prices,
     walletAddress: config.walletAddress,
     lanes: lanesStatus,
+    haikuAgent: haikuAgentState,
     stats: {
       totalTrades: totals.total,
       wins: totals.wins,
@@ -809,6 +816,7 @@ app.listen(config.port, () => {
               resolver.resolveWindow(lane.id, prevWindowTs, lane.interval).catch(err => console.error(`[resolver] Error resolving ${lane.id}:`, err.message));
               candleEngine.resetLane(lane.id);
               superScalp.resetWindow(lane.id, currentWindowTs);
+              try { const { haikuAgent } = require('./haiku-agent'); haikuAgent.cleanup(currentWindowTs); } catch (_) {}
               orderExecutor.clearPendingEntries(lane.id);
               priceTracker.captureOpenPrice(lane.id, lane.interval);
               bootSkipLanes.delete(lane.id);
@@ -903,6 +911,7 @@ app.listen(config.port, () => {
               console.log(`[v2] Window transition ${lane.id}: ${prevWindowTs} → ${currentWindowTs}`);
               dcaEngine.resetLane(lane.id, prevWindowTs);
               trendObserver.reset(lane.id, prevWindowTs);
+              try { const { haikuAgent } = require('./haiku-agent'); haikuAgent.cleanup(currentWindowTs); } catch (_) {}
               // Oracle resolver will handle actual resolution via Data API
               priceTracker.captureOpenPrice(lane.id, lane.interval);
               v2BootSkipLanes.delete(lane.id);
@@ -913,19 +922,51 @@ app.listen(config.port, () => {
             if (global.botPaused) return;
             if (v2BootSkipLanes.has(lane.id)) return;
 
+            // Resolve market and tokenId for this lane+window
+            const market = await marketDiscovery.findMarket(lane.id, currentWindowTs, lane.interval);
+            if (!market) return;
+
+            // Build a mutable config copy with resolved tokenId
+            const liveDirection = (() => {
+              let price = polymarketRTDS.getPrice(lane.asset);
+              if (price == null || polymarketRTDS.isStale()) price = coinbaseWS.getPrice(lane.asset);
+              if (price == null) return null;
+              const openPrice = priceTracker.getOpenPrice(lane.id, lane.interval);
+              if (openPrice == null) return null;
+              return price >= openPrice ? 'UP' : 'DOWN';
+            })();
+            if (!liveDirection) return;
+
+            const resolvedTokenId = liveDirection === 'UP' ? market.upTokenId : market.downTokenId;
+            const mutableTierConfig = { ...tierConfig, _resolvedTokenId: resolvedTokenId };
+
             // DCA engine evaluation
-            const signal = await dcaEngine.evaluate(lane.id, tierConfig, currentWindowTs, remainingSeconds);
+            const signal = await dcaEngine.evaluate(lane.id, mutableTierConfig, currentWindowTs, remainingSeconds);
             if (signal) {
-              const market = await marketDiscovery.findMarket(signal.laneId, signal.windowTs, lane.interval);
-              if (market) {
-                const trade = await orderExecutor.executeEntry(signal, market);
-                if (trade) {
-                  // Add entry to position
-                  positionManager.addEntry(signal.positionId, trade.entry_price, trade.shares, trade.cost, trade.id, signal.isHedge);
-                  const hedgeTag = signal.isHedge ? ' [HEDGE]' : '';
-                  console.log(`[v2] ${lane.id} ${signal.direction} @ $${trade.entry_price} shares=${trade.shares} tier=${signal.tier}${hedgeTag}`);
-                  notifications.tradeEntry({ laneId: trade.lane_id, direction: trade.side, entryPrice: trade.entry_price, shares: trade.shares, cost: trade.cost, irrev: signal.irrev.toFixed(2), type: signal.type });
+              // Haiku agent confirmation gate for DCA
+              const { haikuAgent } = require('./haiku-agent');
+              const elapsedSec = (lane.interval * 60) - remainingSeconds;
+              const haikuResult = await haikuAgent.evaluate(lane.id, lane.asset, lane.interval, currentWindowTs, signal.irrev, elapsedSec);
+
+              if (!haikuResult.approved) {
+                if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in')) {
+                  console.log(`[haiku-gate] ${lane.id} DCA BLOCKED: ${haikuResult.reason}`);
                 }
+                return; // Skip this DCA entry
+              }
+
+              // If Haiku returned a direction, override signal direction
+              if (haikuResult.direction) {
+                signal.direction = haikuResult.direction;
+              }
+
+              const trade = await orderExecutor.executeEntry(signal, market);
+              if (trade) {
+                // Add entry to position
+                positionManager.addEntry(signal.positionId, trade.entry_price, trade.shares, trade.cost, trade.id, signal.isHedge);
+                const hedgeTag = signal.isHedge ? ' [HEDGE]' : '';
+                console.log(`[v2] ${lane.id} ${signal.direction} @ $${trade.entry_price} shares=${trade.shares} tier=${signal.tier}${hedgeTag}`);
+                notifications.tradeEntry({ laneId: trade.lane_id, direction: trade.side, entryPrice: trade.entry_price, shares: trade.shares, cost: trade.cost, irrev: signal.irrev.toFixed(2), type: signal.type });
               }
             }
           } catch (err) {

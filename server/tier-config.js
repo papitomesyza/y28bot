@@ -30,7 +30,7 @@ const TIERS = deepFreeze([
     priceRange: { min: 0.40, max: 0.65 },
     maxEntriesPerCandle: 1,
     hedgeEnabled: false,
-    assets: ['BTC', 'ETH', 'XRP', 'HYPE'],
+    assets: ['BTC', 'ETH'],
   },
   {
     id: 2,
@@ -43,7 +43,7 @@ const TIERS = deepFreeze([
     priceRange: { min: 0.40, max: 0.75 },
     maxEntriesPerCandle: 2,
     hedgeEnabled: false,
-    assets: ['BTC', 'ETH', 'XRP', 'HYPE'],
+    assets: ['BTC', 'ETH'],
   },
   {
     id: 3,
@@ -59,7 +59,7 @@ const TIERS = deepFreeze([
     hedgeEnabled: true,
     hedgeReversalSeconds: 120,     // price must stay reversed 2 min before hedge
     hedgeMaxPct: 0.25,             // max 25% of position size
-    assets: ['BTC', 'ETH', 'SOL', 'XRP', 'HYPE', 'DOGE', 'BNB'],
+    assets: ['BTC', 'ETH'],
   },
   {
     id: 4,
@@ -75,7 +75,7 @@ const TIERS = deepFreeze([
     hedgeEnabled: true,
     hedgeReversalSeconds: 180,     // 3 min sustained reversal
     hedgeMaxPct: 0.25,
-    assets: ['BTC', 'ETH', 'SOL', 'XRP'],
+    assets: ['BTC', 'ETH'],
   },
 ]);
 

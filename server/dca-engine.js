@@ -48,7 +48,7 @@ class DCAEngine {
     }
 
     // --- Go signal check ---
-    const trendResult = trendObserver.evaluate(laneId, windowTs, tierConfig);
+    const trendResult = trendObserver.evaluate(laneId, windowTs, tierConfig, irrev);
     if (!trendResult || !trendResult.goSignal) {
       this._throttleLog(laneId, `[DCAEngine] ${laneId} waiting for go signal (irrev=${irrev.toFixed(2)})`);
       return null;
@@ -225,9 +225,10 @@ class DCAEngine {
   _calculateSize(tierConfig, askPrice) {
     const poolBalance = db.getPoolBalance();
     const allocation = poolBalance * tierConfig.allocationPct;
-    const perCandleMax = allocation * 0.15;
-    const perEntrySize = perCandleMax / tierConfig.maxEntriesPerCandle;
-    const shares = Math.floor(perEntrySize / askPrice);
+    const effectiveMaxEntries = Math.min(tierConfig.maxEntriesPerCandle, 4);
+    const perEntrySize = Math.max(allocation / effectiveMaxEntries, 2.00);
+    const cappedSize = Math.min(perEntrySize, poolBalance * 0.25);
+    const shares = Math.floor(cappedSize / askPrice);
     const cost = Math.round(shares * askPrice * 100) / 100;
     return { shares, cost };
   }
