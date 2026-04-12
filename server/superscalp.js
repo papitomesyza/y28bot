@@ -112,10 +112,10 @@ class SuperScalp {
 
   // FIX 2: Unified minimum irrev threshold — midpoint must match scalp gate minimums
   getUnifiedMinThreshold(asset, interval) {
-    if (interval === 5) return config.irrevThresholds.base; // 1.9 for 5M
+    if (interval === 5) return config.irrevThresholds.base; // 1.2 for 5M
     // 15M lanes
     if (asset === 'BTC') return 3.5;
-    return 2.5; // ETH, SOL, XRP
+    return 2.5; // ETH
   }
 
   // --- Midpoint gate check ---
@@ -285,68 +285,6 @@ class SuperScalp {
       }
     }
 
-    // LAYER 4 — Trend Consistency (SOFT — log only)
-    if (shouldLog) {
-      const arr = volatilityTracker.ticks.get(asset);
-      if (arr && arr.length >= 2) {
-        const cutoff = now - gates.trendLookbackSeconds * 1000;
-        const recent = arr.filter(t => t.timestamp >= cutoff);
-        if (recent.length >= 2) {
-          const bucketSize = 5000;
-          const buckets = [];
-          let bucketStart = recent[0].timestamp;
-          let bucketTicks = [recent[0]];
-          for (let i = 1; i < recent.length; i++) {
-            if (recent[i].timestamp - bucketStart >= bucketSize) {
-              buckets.push(bucketTicks);
-              bucketTicks = [recent[i]];
-              bucketStart = recent[i].timestamp;
-            } else {
-              bucketTicks.push(recent[i]);
-            }
-          }
-          if (bucketTicks.length > 0) buckets.push(bucketTicks);
-
-          if (buckets.length >= 2) {
-            let matching = 0;
-            let total = 0;
-            for (let i = 1; i < buckets.length; i++) {
-              const prevAvg = buckets[i - 1].reduce((s, t) => s + t.price, 0) / buckets[i - 1].length;
-              const currAvg = buckets[i].reduce((s, t) => s + t.price, 0) / buckets[i].length;
-              const bucketDir = currAvg >= prevAvg ? 'UP' : 'DOWN';
-              if (bucketDir === direction) matching++;
-              total++;
-            }
-            const trendScore = matching / total;
-            console.log(`[enhanced] ${laneId} trend=${trendScore.toFixed(2)} (${direction})`);
-          }
-        }
-      }
-    }
-
-    // LAYER 5 — Cross-Asset Momentum (SOFT — log only)
-    if (shouldLog) {
-      const otherAssets = config.assets.filter(a => a !== asset);
-      let confirmCount = 0;
-      const totalSeconds = interval * 60;
-      const remainingSeconds = priceTracker.getRemainingSeconds(interval);
-      for (const otherAsset of otherAssets) {
-        const otherLaneId = `${otherAsset}-${interval}M`;
-        const otherKey = `${otherLaneId}:${windowTs}`;
-        const otherWin = priceTracker.windows.get(otherKey);
-        if (!otherWin || !otherWin.capturedOpen || otherWin.openPrice == null) continue;
-        const otherOpen = otherWin.openPrice;
-        const otherPrice = coinbaseWS.getPrice(otherAsset);
-        if (otherPrice == null) continue;
-        const otherIrrev = this.calculateIrrev(otherAsset, otherOpen, otherPrice, remainingSeconds, totalSeconds);
-        const otherDir = this.getDirection(otherOpen, otherPrice);
-        if (otherIrrev > gates.crossAssetMinIrrev && otherDir === direction) {
-          confirmCount++;
-        }
-      }
-      console.log(`[enhanced] ${laneId} cross-asset: ${confirmCount}/3 confirm ${direction}`);
-    }
-
     return { pass: true, reason: 'all enhanced gates passed' };
   }
 
@@ -404,34 +342,6 @@ class SuperScalp {
 
     const irrev = this.calculateIrrev(asset, openPrice, currentPrice, remainingSeconds, totalSeconds);
     const direction = this.getDirection(openPrice, currentPrice);
-
-    // Momentum gate — block counter-trend UP trades
-    try {
-      const { momentumGate } = require('./momentum-gate');
-      const gateResult = momentumGate.isDirectionAllowed(asset, direction, laneId);
-      if (!gateResult.allowed) {
-        const now = Date.now();
-        const logKey = `gate-${laneId}`;
-        const lastLog = this._lastLogTime.get(logKey) || 0;
-        if (now - lastLog >= 10000) {
-          this._lastLogTime.set(logKey, now);
-          console.log(`[momentum-gate] ${laneId} ${direction} BLOCKED: ${gateResult.reason}`);
-        }
-        return null;
-      }
-      // Dry-run logging for would-be blocks (gate disabled)
-      if (gateResult.reason && gateResult.reason.includes('would block')) {
-        const now = Date.now();
-        const logKey = `gate-dry-${laneId}`;
-        const lastLog = this._lastLogTime.get(logKey) || 0;
-        if (now - lastLog >= 30000) {
-          this._lastLogTime.set(logKey, now);
-          console.log(`[momentum-gate] DRY RUN: ${laneId} ${direction} would be blocked: ${gateResult.reason}`);
-        }
-      }
-    } catch (err) {
-      // Gate not ready yet — allow trade
-    }
 
     // Throttled logging: every 30 seconds per lane
     const now = Date.now();

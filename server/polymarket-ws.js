@@ -84,6 +84,16 @@ class PolymarketRTDS {
                     candleEngine.recordTick(lane.id, parseFloat(value), Date.now());
                   }
                 }
+                // Also feed v2 lanes (1H/4H) for Haiku candle analysis
+                try {
+                  const { buildV2Lanes } = require('./tier-config');
+                  const v2Lanes = buildV2Lanes();
+                  for (const lane of v2Lanes) {
+                    if (lane.asset === asset && (lane.interval === 60 || lane.interval === 240)) {
+                      candleEngine.recordTick(lane.id, parseFloat(value), Date.now());
+                    }
+                  }
+                } catch (_) {}
               } catch (err) {
                 // Candle engine not ready yet during startup — safe to ignore
               }

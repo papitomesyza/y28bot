@@ -14,7 +14,15 @@ class CandleEngine {
 
   recordTick(laneId, price, timestamp) {
     const parts = laneId.split('-');
-    const interval = parseInt(parts[1], 10);
+    const rawInterval = parts[1];
+    let interval;
+    if (rawInterval.endsWith('H')) {
+      interval = parseInt(rawInterval, 10) * 60;
+    } else if (rawInterval.endsWith('M')) {
+      interval = parseInt(rawInterval, 10);
+    } else {
+      interval = parseInt(rawInterval, 10);
+    }
     const windowTs = priceTracker.getWindowTs(interval);
 
     let buf = this.liveBuffers.get(laneId);
@@ -115,7 +123,8 @@ class CandleEngine {
   getLiveCandleWithTimer(laneId) {
     const live = this.getLiveCandle(laneId);
     if (!live) return null;
-    const interval = parseInt(laneId.split('-')[1], 10);
+    const rawInt = laneId.split('-')[1];
+    const interval = rawInt.endsWith('H') ? parseInt(rawInt, 10) * 60 : parseInt(rawInt, 10);
     live.remainingSeconds = priceTracker.getRemainingSeconds(interval);
     return live;
   }

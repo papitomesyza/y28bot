@@ -103,7 +103,7 @@ global.runtimeConfig = {
   spreadScalpIrrev: config.spreadScalpIrrev,
   limitOrderTimeoutMs: config.limitOrderTimeoutMs,
   gateEnabled: true,
-  maxAskPrice: 0.70,
+  maxAskPrice: 0.85,
 };
 
 // During startup, let crashes propagate so broken config is caught immediately
@@ -760,8 +760,6 @@ app.listen(config.port, () => {
   const candleCloseDedup = new Map(); // tracks ${asset}:${windowTs} to avoid duplicate onCandleClose calls
 
   const bootSkipLanes = new Set(config.lanes.map(l => l.id));
-  const offHoursLogMap = new Map();
-
   // --- v2 lanes (Tier 3/4 DCA) ---
   const v2Lanes = buildV2Lanes().filter(l => l.interval === 60 || l.interval === 240);
 
@@ -828,17 +826,6 @@ app.listen(config.port, () => {
             if (global.botPaused) return;
             if (bootSkipLanes.has(lane.id)) return;
 
-            // Log during Asian off-hours (21:00-04:59 UTC) — data collection only
-            const utcHour = new Date().getUTCHours();
-            if (utcHour >= 21 || utcHour < 5) {
-              const now = Date.now();
-              const lastLog = offHoursLogMap.get(lane.id) || 0;
-              if (now - lastLog >= 300000) {
-                offHoursLogMap.set(lane.id, now);
-                console.log('[scalp] Asian off-hours active (reversal regime) — logging only');
-              }
-            }
-
             // --- Midpoint path ---
             try {
               const signal = await superScalp.evaluate(lane.id);
@@ -869,21 +856,6 @@ app.listen(config.port, () => {
               console.error(`[scalp] Error evaluating ${lane.id}:`, err.message);
             }
 
-            // --- Spread scalp path (independent of midpoint) ---
-            try {
-              const ssSignal = await spreadScalp.evaluate(lane.id);
-              if (ssSignal) {
-                const ssTrade = await orderExecutor.executeEntry(ssSignal, ssSignal.market);
-                if (ssTrade) {
-                  spreadScalp.recordEntry(lane.id, ssSignal.windowTs);
-                  console.log(`[spread-scalp] Entered ${lane.id} ${ssSignal.direction} @ $${ssSignal.entryPrice} shares=${ssSignal.shares} irrev=${ssSignal.irrev.toFixed(2)}`);
-                  notifications.tradeEntry({ laneId: ssTrade.lane_id, direction: ssTrade.side, entryPrice: ssTrade.entry_price, shares: ssTrade.shares, cost: ssTrade.cost, irrev: ssSignal.irrev.toFixed(2), type: 'spread_scalp' });
-                  candleEngine.markTradeEntry(ssTrade.lane_id, ssSignal.windowTs, ssTrade.id, ssTrade.entry_price, Date.now());
-                }
-              }
-            } catch (err) {
-              console.error(`[spread-scalp] Error evaluating ${lane.id}:`, err.message);
-            }
           } catch (err) {
             console.error(`[loop] Error in lane ${lane.id}:`, err.message);
           }
@@ -924,7 +896,17 @@ app.listen(config.port, () => {
 
             // Resolve market and tokenId for this lane+window
             const market = await marketDiscovery.findMarket(lane.id, currentWindowTs, lane.interval);
-            if (!market) return;
+            if (!market) {
+              // Throttle this log to once per 60s per lane
+              const logKey = `v2-nomarket-${lane.id}`;
+              const now = Date.now();
+              const last = (global._v2LogThrottle || (global._v2LogThrottle = new Map())).get(logKey) || 0;
+              if (now - last >= 60000) {
+                global._v2LogThrottle.set(logKey, now);
+                console.log(`[v2] ${lane.id} no market found for window ${currentWindowTs}`);
+              }
+              return;
+            }
 
             // Build a mutable config copy with resolved tokenId
             const liveDirection = (() => {
@@ -935,7 +917,18 @@ app.listen(config.port, () => {
               if (openPrice == null) return null;
               return price >= openPrice ? 'UP' : 'DOWN';
             })();
-            if (!liveDirection) return;
+            if (!liveDirection) {
+              const logKey = `v2-nodir-${lane.id}`;
+              const now = Date.now();
+              const last = (global._v2LogThrottle || (global._v2LogThrottle = new Map())).get(logKey) || 0;
+              if (now - last >= 60000) {
+                global._v2LogThrottle.set(logKey, now);
+                const price = polymarketRTDS.getPrice(lane.asset) || coinbaseWS.getPrice(lane.asset);
+                const openPrice = priceTracker.getOpenPrice(lane.id, lane.interval);
+                console.log(`[v2] ${lane.id} no live direction — price=${price}, openPrice=${openPrice}`);
+              }
+              return;
+            }
 
             const resolvedTokenId = liveDirection === 'UP' ? market.upTokenId : market.downTokenId;
             const mutableTierConfig = { ...tierConfig, _resolvedTokenId: resolvedTokenId };
