@@ -637,6 +637,48 @@ app.get('/api/v2/tiers', auth.authMiddleware, (req, res) => {
   res.json(TIERS);
 });
 
+// --- Backtest API ---
+
+app.post('/api/backtest/run', auth.authMiddleware, async (req, res) => {
+  const { assets, intervals, timingPoints, hours } = req.body;
+
+  // Prevent running multiple backtests simultaneously
+  if (global._backtestRunning) {
+    return res.json({ error: 'Backtest already running' });
+  }
+  global._backtestRunning = true;
+  global._backtestProgress = { status: 'starting', pct: 0, phase: 'init' };
+
+  // Run async — don't block the response
+  res.json({ started: true, message: 'Backtest started. Poll /api/backtest/status for progress.' });
+
+  try {
+    const { runBacktest } = require('./backtester');
+    const results = await runBacktest({
+      assets: assets || ['BTC', 'ETH'],
+      intervals: intervals || [5, 15, 60, 240],
+      timingPoints: timingPoints || [0.20, 0.30, 0.40, 0.50],
+      hours: hours || 24,
+      onProgress: (p) => { global._backtestProgress = p; },
+    });
+    global._backtestResults = results;
+    global._backtestProgress = { status: 'complete', pct: 100, phase: 'done' };
+  } catch (err) {
+    console.error('[backtest] Error:', err.message);
+    global._backtestProgress = { status: 'error', error: err.message };
+  } finally {
+    global._backtestRunning = false;
+  }
+});
+
+app.get('/api/backtest/status', auth.authMiddleware, (req, res) => {
+  res.json({
+    running: !!global._backtestRunning,
+    progress: global._backtestProgress || null,
+    results: global._backtestResults || null,
+  });
+});
+
 // --- Static files & client-side routing ---
 
 const dashboardPath = path.join(__dirname, '..', 'dashboard', 'dist');
