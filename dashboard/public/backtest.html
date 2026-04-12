@@ -1,0 +1,656 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>y28 Haiku Backtester</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0e17;
+    color: #e2e8f0;
+    font-family: 'Space Grotesk', sans-serif;
+    min-height: 100vh;
+  }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+
+  /* Header */
+  .header {
+    display: flex; align-items: center; gap: 16px;
+    margin-bottom: 32px; padding-bottom: 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+  .header h1 {
+    font-size: 24px; font-weight: 700; color: #00D341;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .header .tag {
+    background: rgba(0,211,65,0.1); color: #00D341;
+    padding: 4px 10px; border-radius: 4px; font-size: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .back-link {
+    color: #64748b; text-decoration: none; font-size: 14px;
+    margin-left: auto;
+  }
+  .back-link:hover { color: #e2e8f0; }
+
+  /* Login */
+  .login-box {
+    background: rgba(17,25,40,0.65); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 32px; max-width: 400px; margin: 80px auto;
+  }
+  .login-box h2 { margin-bottom: 16px; font-size: 18px; }
+  .login-box input {
+    width: 100%; padding: 10px 14px; background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 8px;
+    color: #e2e8f0; font-size: 14px; margin-bottom: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .login-box input:focus { outline: none; border-color: #00D341; }
+
+  /* Buttons */
+  .btn {
+    padding: 10px 20px; border: none; border-radius: 8px;
+    font-family: 'Space Grotesk', sans-serif; font-weight: 600;
+    font-size: 14px; cursor: pointer; transition: all 0.2s;
+  }
+  .btn-primary { background: #00D341; color: #000; }
+  .btn-primary:hover { background: #00f04a; transform: translateY(-1px); }
+  .btn-primary:disabled { background: #1a3a1a; color: #4a6a4a; cursor: not-allowed; transform: none; }
+  .btn-secondary { background: rgba(255,255,255,0.06); color: #94a3b8; }
+  .btn-secondary:hover { background: rgba(255,255,255,0.1); }
+  .btn-danger { background: #dc2626; color: #fff; }
+
+  /* Config Panel */
+  .config-panel {
+    background: rgba(17,25,40,0.65); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 24px; margin-bottom: 24px;
+  }
+  .config-panel h2 { font-size: 16px; margin-bottom: 16px; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; font-size: 12px; }
+  .config-row {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px; margin-bottom: 16px;
+  }
+  .config-field label {
+    display: block; font-size: 12px; color: #64748b;
+    margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .config-field select, .config-field input[type="number"] {
+    width: 100%; padding: 8px 12px; background: rgba(0,0,0,0.3);
+    border: 1px solid rgba(255,255,255,0.1); border-radius: 6px;
+    color: #e2e8f0; font-size: 14px; font-family: 'JetBrains Mono', monospace;
+  }
+  .config-field select:focus, .config-field input[type="number"]:focus {
+    outline: none; border-color: #00D341;
+  }
+  .config-actions { display: flex; gap: 12px; align-items: center; margin-top: 8px; }
+  .est-cost {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #64748b;
+  }
+
+  /* Progress */
+  .progress-panel {
+    background: rgba(17,25,40,0.65); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 24px; margin-bottom: 24px;
+    display: none;
+  }
+  .progress-panel.active { display: block; }
+  .progress-bar-bg {
+    height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px;
+    overflow: hidden; margin: 12px 0;
+  }
+  .progress-bar-fill {
+    height: 100%; background: linear-gradient(90deg, #00D341, #00f04a);
+    border-radius: 4px; transition: width 0.5s ease;
+    box-shadow: 0 0 12px rgba(0,211,65,0.3);
+  }
+  .progress-stats {
+    display: flex; gap: 24px; flex-wrap: wrap; margin-top: 12px;
+  }
+  .progress-stat {
+    font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  }
+  .progress-stat .label { color: #64748b; }
+  .progress-stat .value { color: #e2e8f0; font-weight: 500; }
+  .progress-stat .value.green { color: #00D341; }
+  .progress-stat .value.red { color: #ef4444; }
+
+  /* Results */
+  .results-panel {
+    display: none;
+  }
+  .results-panel.active { display: block; }
+
+  .results-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 16px; margin-bottom: 24px;
+  }
+  .stat-card {
+    background: rgba(17,25,40,0.65); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 20px;
+  }
+  .stat-card .card-label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: #64748b; margin-bottom: 8px;
+  }
+  .stat-card .card-value {
+    font-family: 'JetBrains Mono', monospace; font-size: 28px;
+    font-weight: 700;
+  }
+  .stat-card .card-value.green { color: #00D341; }
+  .stat-card .card-value.red { color: #ef4444; }
+  .stat-card .card-value.yellow { color: #eab308; }
+  .stat-card .card-sub {
+    font-size: 12px; color: #64748b; margin-top: 4px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* Tables */
+  .results-table-wrap {
+    background: rgba(17,25,40,0.65); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; overflow: hidden; margin-bottom: 24px;
+  }
+  .results-table-wrap h3 {
+    padding: 16px 20px 12px; font-size: 14px; color: #94a3b8;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  table {
+    width: 100%; border-collapse: collapse;
+    font-family: 'JetBrains Mono', monospace; font-size: 13px;
+  }
+  th {
+    text-align: left; padding: 10px 16px; color: #64748b;
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+    font-weight: 500;
+  }
+  td {
+    padding: 10px 16px; border-bottom: 1px solid rgba(255,255,255,0.02);
+  }
+  tr:hover { background: rgba(255,255,255,0.02); }
+  .best-row { background: rgba(0,211,65,0.06) !important; }
+  .best-row td:first-child::before { content: '★ '; color: #00D341; }
+  .acc-high { color: #00D341; font-weight: 700; }
+  .acc-mid { color: #eab308; font-weight: 500; }
+  .acc-low { color: #ef4444; }
+
+  /* Error */
+  .error-msg {
+    background: rgba(239,68,68,0.1); border: 1px solid rgba(239,68,68,0.2);
+    border-radius: 8px; padding: 12px 16px; color: #fca5a5;
+    font-size: 14px; margin-bottom: 16px; display: none;
+  }
+  .error-msg.active { display: block; }
+
+  /* Pulse animation */
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+  .pulsing { animation: pulse 1.5s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <h1>Y28 BACKTESTER</h1>
+    <span class="tag">HAIKU 4.5</span>
+    <a href="/" class="back-link">← Dashboard</a>
+  </div>
+
+  <!-- Login -->
+  <div id="loginBox" class="login-box" style="display:none;">
+    <h2>Login</h2>
+    <input type="password" id="passInput" placeholder="Password" onkeydown="if(event.key==='Enter')doLogin()">
+    <button class="btn btn-primary" onclick="doLogin()" style="width:100%">Login</button>
+  </div>
+
+  <!-- Main content (hidden until logged in) -->
+  <div id="mainContent" style="display:none;">
+
+    <div class="error-msg" id="errorMsg"></div>
+
+    <!-- Config -->
+    <div class="config-panel">
+      <h2>Backtest Configuration</h2>
+      <div class="config-row">
+        <div class="config-field">
+          <label>Period (hours)</label>
+          <input type="number" id="cfgHours" value="24" min="1" max="72">
+        </div>
+        <div class="config-field">
+          <label>Assets</label>
+          <select id="cfgAssets">
+            <option value="both">BTC + ETH</option>
+            <option value="btc">BTC only</option>
+            <option value="eth">ETH only</option>
+          </select>
+        </div>
+        <div class="config-field">
+          <label>Timeframes</label>
+          <select id="cfgIntervals">
+            <option value="all">All (5M, 15M, 1H, 4H)</option>
+            <option value="short">Short (5M, 15M)</option>
+            <option value="long">Long (1H, 4H)</option>
+            <option value="5">5M only</option>
+            <option value="15">15M only</option>
+            <option value="60">1H only</option>
+            <option value="240">4H only</option>
+          </select>
+        </div>
+        <div class="config-field">
+          <label>Timing Points</label>
+          <select id="cfgTimings">
+            <option value="standard">20%, 30%, 40%, 50%</option>
+            <option value="early">15%, 20%, 25%, 30%</option>
+            <option value="late">30%, 40%, 50%, 60%</option>
+            <option value="fine">20%, 25%, 30%, 35%, 40%, 45%, 50%</option>
+          </select>
+        </div>
+      </div>
+      <div class="config-actions">
+        <button class="btn btn-primary" id="startBtn" onclick="startBacktest()">
+          ▶ Start Backtest
+        </button>
+        <span class="est-cost" id="estCost">Est. ~2,484 calls · ~$0.73</span>
+      </div>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-panel" id="progressPanel">
+      <div style="display:flex;justify-content:space-between;align-items:center;">
+        <span class="pulsing" id="progressLabel" style="font-weight:600;">Starting...</span>
+        <span id="progressPct" style="font-family:'JetBrains Mono',monospace;color:#00D341;font-size:18px;font-weight:700;">0%</span>
+      </div>
+      <div class="progress-bar-bg">
+        <div class="progress-bar-fill" id="progressBar" style="width:0%"></div>
+      </div>
+      <div class="progress-stats">
+        <div class="progress-stat"><span class="label">Phase: </span><span class="value" id="pPhase">—</span></div>
+        <div class="progress-stat"><span class="label">Calls: </span><span class="value" id="pCalls">—</span></div>
+        <div class="progress-stat"><span class="label">Live Accuracy: </span><span class="value green" id="pAcc">—</span></div>
+        <div class="progress-stat"><span class="label">Elapsed: </span><span class="value" id="pElapsed">0:00</span></div>
+        <div class="progress-stat"><span class="label">ETA: </span><span class="value" id="pEta">—</span></div>
+      </div>
+    </div>
+
+    <!-- Results -->
+    <div class="results-panel" id="resultsPanel">
+
+      <!-- Summary cards -->
+      <div class="results-grid" id="summaryCards"></div>
+
+      <!-- Accuracy by Timeframe × Timing Point (the key table) -->
+      <div class="results-table-wrap" id="mainTableWrap">
+        <h3>Accuracy by Timeframe × Timing Point</h3>
+        <table id="mainTable"><thead></thead><tbody></tbody></table>
+      </div>
+
+      <!-- By Asset -->
+      <div class="results-table-wrap" id="assetTableWrap">
+        <h3>Accuracy by Asset</h3>
+        <table id="assetTable"><thead></thead><tbody></tbody></table>
+      </div>
+
+      <!-- By Direction -->
+      <div class="results-table-wrap" id="dirTableWrap">
+        <h3>Accuracy by Direction</h3>
+        <table id="dirTable"><thead></thead><tbody></tbody></table>
+      </div>
+
+      <!-- Raw data download -->
+      <div style="margin-top:16px;display:flex;gap:12px;">
+        <button class="btn btn-secondary" onclick="downloadRaw()">⬇ Download Raw Results (JSON)</button>
+        <button class="btn btn-secondary" onclick="downloadCSV()">⬇ Download CSV</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('y28_token');
+let pollTimer = null;
+let startTime = null;
+let backtestResults = null;
+
+// --- Auth ---
+function checkAuth() {
+  if (token) {
+    document.getElementById('loginBox').style.display = 'none';
+    document.getElementById('mainContent').style.display = 'block';
+    updateEstimate();
+  } else {
+    document.getElementById('loginBox').style.display = 'block';
+    document.getElementById('mainContent').style.display = 'none';
+  }
+}
+
+async function doLogin() {
+  const pass = document.getElementById('passInput').value;
+  try {
+    const r = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: pass }),
+    });
+    const d = await r.json();
+    if (d.token) {
+      token = d.token;
+      localStorage.setItem('y28_token', token);
+      checkAuth();
+    } else {
+      alert('Invalid password');
+    }
+  } catch (e) { alert('Login failed: ' + e.message); }
+}
+
+function api(url, opts = {}) {
+  return fetch(url, {
+    ...opts,
+    headers: { ...opts.headers, 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' },
+  }).then(r => { if (r.status === 401) { token = null; localStorage.removeItem('y28_token'); checkAuth(); } return r.json(); });
+}
+
+// --- Config ---
+function getConfig() {
+  const hours = parseInt(document.getElementById('cfgHours').value) || 24;
+  const assetVal = document.getElementById('cfgAssets').value;
+  const assets = assetVal === 'btc' ? ['BTC'] : assetVal === 'eth' ? ['ETH'] : ['BTC', 'ETH'];
+  const intVal = document.getElementById('cfgIntervals').value;
+  let intervals;
+  if (intVal === 'all') intervals = [5, 15, 60, 240];
+  else if (intVal === 'short') intervals = [5, 15];
+  else if (intVal === 'long') intervals = [60, 240];
+  else intervals = [parseInt(intVal)];
+  const tVal = document.getElementById('cfgTimings').value;
+  let timingPoints;
+  if (tVal === 'standard') timingPoints = [0.20, 0.30, 0.40, 0.50];
+  else if (tVal === 'early') timingPoints = [0.15, 0.20, 0.25, 0.30];
+  else if (tVal === 'late') timingPoints = [0.30, 0.40, 0.50, 0.60];
+  else timingPoints = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50];
+  return { assets, intervals, timingPoints, hours };
+}
+
+function updateEstimate() {
+  const cfg = getConfig();
+  let calls = 0;
+  for (const interval of cfg.intervals) {
+    const candles = Math.floor(cfg.hours * 60 / interval);
+    calls += candles * cfg.assets.length * cfg.timingPoints.length;
+  }
+  const cost = ((calls * 350 * 0.80 / 1e6) + (calls * 3 * 4.0 / 1e6)).toFixed(2);
+  document.getElementById('estCost').textContent = `Est. ~${calls.toLocaleString()} calls · ~$${cost}`;
+}
+
+document.getElementById('cfgHours').addEventListener('input', updateEstimate);
+document.getElementById('cfgAssets').addEventListener('change', updateEstimate);
+document.getElementById('cfgIntervals').addEventListener('change', updateEstimate);
+document.getElementById('cfgTimings').addEventListener('change', updateEstimate);
+
+// --- Backtest ---
+async function startBacktest() {
+  const cfg = getConfig();
+  const btn = document.getElementById('startBtn');
+  btn.disabled = true;
+  btn.textContent = '⏳ Running...';
+
+  document.getElementById('errorMsg').className = 'error-msg';
+  document.getElementById('progressPanel').className = 'progress-panel active';
+  document.getElementById('resultsPanel').className = 'results-panel';
+  startTime = Date.now();
+
+  try {
+    const r = await api('/api/backtest/run', {
+      method: 'POST',
+      body: JSON.stringify(cfg),
+    });
+    if (r.error) throw new Error(r.error);
+    pollProgress();
+  } catch (e) {
+    showError(e.message);
+    btn.disabled = false;
+    btn.textContent = '▶ Start Backtest';
+  }
+}
+
+function pollProgress() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = setInterval(async () => {
+    try {
+      const r = await api('/api/backtest/status');
+      const p = r.progress;
+      if (!p) return;
+
+      // Update progress UI
+      document.getElementById('progressPct').textContent = (p.pct || 0) + '%';
+      document.getElementById('progressBar').style.width = (p.pct || 0) + '%';
+      document.getElementById('progressLabel').textContent = p.message || p.status || 'Running...';
+      document.getElementById('pPhase').textContent = p.phase || '—';
+
+      if (p.message) {
+        const m = p.message.match(/(\d+)\/(\d+)/);
+        if (m) document.getElementById('pCalls').textContent = m[1] + ' / ' + m[2];
+      }
+      if (p.currentAccuracy) document.getElementById('pAcc').textContent = p.currentAccuracy;
+
+      // Elapsed
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      const em = Math.floor(elapsed / 60);
+      const es = elapsed % 60;
+      document.getElementById('pElapsed').textContent = em + ':' + String(es).padStart(2, '0');
+
+      // ETA
+      if (p.pct > 5) {
+        const total = elapsed / (p.pct / 100);
+        const remaining = Math.max(0, Math.floor(total - elapsed));
+        const rm = Math.floor(remaining / 60);
+        const rs = remaining % 60;
+        document.getElementById('pEta').textContent = rm + ':' + String(rs).padStart(2, '0');
+      }
+
+      // Complete
+      if (p.status === 'complete' && r.results) {
+        clearInterval(pollTimer);
+        backtestResults = r.results;
+        renderResults(r.results);
+        document.getElementById('progressLabel').textContent = '✅ Backtest complete!';
+        document.getElementById('progressLabel').className = '';
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('startBtn').textContent = '▶ Start Backtest';
+      }
+
+      // Error
+      if (p.status === 'error') {
+        clearInterval(pollTimer);
+        showError(p.error || 'Unknown error');
+        document.getElementById('startBtn').disabled = false;
+        document.getElementById('startBtn').textContent = '▶ Start Backtest';
+      }
+    } catch (e) {
+      console.error('Poll error:', e);
+    }
+  }, 2000);
+}
+
+function showError(msg) {
+  const el = document.getElementById('errorMsg');
+  el.textContent = '⚠ ' + msg;
+  el.className = 'error-msg active';
+}
+
+// --- Render Results ---
+function renderResults(data) {
+  document.getElementById('resultsPanel').className = 'results-panel active';
+
+  // Summary cards
+  const s = data.summary;
+  const accClass = s.accuracyExWait >= 55 ? 'green' : s.accuracyExWait >= 50 ? 'yellow' : 'red';
+  document.getElementById('summaryCards').innerHTML = `
+    <div class="stat-card">
+      <div class="card-label">Accuracy (ex-WAIT)</div>
+      <div class="card-value ${accClass}">${s.accuracyExWait}%</div>
+      <div class="card-sub">${s.totalCorrect}W / ${s.totalWrong}L</div>
+    </div>
+    <div class="stat-card">
+      <div class="card-label">Total Calls</div>
+      <div class="card-value">${s.totalCalls}</div>
+      <div class="card-sub">${s.totalWait} WAITs (${s.totalCalls > 0 ? ((s.totalWait/s.totalCalls)*100).toFixed(1) : 0}%)</div>
+    </div>
+    <div class="stat-card">
+      <div class="card-label">API Cost</div>
+      <div class="card-value">$${data.cost.estCostUsd}</div>
+      <div class="card-sub">${(data.cost.estInputTokens/1000).toFixed(0)}K input tokens</div>
+    </div>
+    <div class="stat-card">
+      <div class="card-label">Best Combo</div>
+      <div class="card-value green" style="font-size:20px">${findBestCombo(data)}</div>
+      <div class="card-sub">Highest accuracy timeframe × timing</div>
+    </div>
+  `;
+
+  // Main table: Timeframe × Timing
+  renderMainTable(data);
+  renderAssetTable(data);
+  renderDirTable(data);
+}
+
+function findBestCombo(data) {
+  let best = '', bestAcc = -1;
+  for (const [key, val] of Object.entries(data.byTimingPoint)) {
+    if (val.accuracy > bestAcc && val.calls >= 5) {
+      bestAcc = val.accuracy;
+      best = key;
+    }
+  }
+  if (!best) return 'N/A';
+  const [interval, timing] = best.split('-');
+  const tfLabel = interval === '5' ? '5M' : interval === '15' ? '15M' : interval === '60' ? '1H' : '4H';
+  return `${tfLabel} @ ${Math.round(parseFloat(timing) * 100)}% → ${bestAcc}%`;
+}
+
+function accColor(acc) {
+  if (acc >= 60) return 'acc-high';
+  if (acc >= 50) return 'acc-mid';
+  return 'acc-low';
+}
+
+function renderMainTable(data) {
+  const timings = data.config.timingPoints;
+  const intervals = data.config.intervals;
+
+  let thead = '<tr><th>Timeframe</th>';
+  for (const t of timings) thead += `<th>${Math.round(t*100)}% elapsed</th>`;
+  thead += '<th>Best</th><th>WAIT %</th></tr>';
+
+  let tbody = '';
+  let bestOverall = { key: '', acc: -1 };
+
+  for (const iv of intervals) {
+    const tfLabel = iv === 5 ? '5M' : iv === 15 ? '15M' : iv === 60 ? '1H' : '4H';
+    const tf = data.byTimeframe[String(iv)];
+    let bestAcc = -1, bestTp = '';
+
+    tbody += `<tr>`;
+    tbody += `<td style="font-weight:600">${tfLabel}</td>`;
+
+    for (const t of timings) {
+      const key = `${iv}-${t}`;
+      const tp = data.byTimingPoint[key];
+      if (tp && tp.calls > 0) {
+        const cls = accColor(tp.accuracy);
+        tbody += `<td class="${cls}">${tp.accuracy}% <span style="color:#4a5568;font-size:11px">(${tp.correct}/${tp.correct+tp.wrong})</span></td>`;
+        if (tp.accuracy > bestAcc) { bestAcc = tp.accuracy; bestTp = Math.round(t*100)+'%'; }
+        if (tp.accuracy > bestOverall.acc && tp.calls >= 5) { bestOverall = { key: `${tfLabel}@${Math.round(t*100)}%`, acc: tp.accuracy }; }
+      } else {
+        tbody += `<td style="color:#334155">—</td>`;
+      }
+    }
+
+    tbody += `<td class="acc-high">${bestTp} (${bestAcc.toFixed(1)}%)</td>`;
+    tbody += `<td>${tf ? ((tf.wait / tf.calls) * 100).toFixed(1) : 0}%</td>`;
+    tbody += '</tr>';
+  }
+
+  document.querySelector('#mainTable thead').innerHTML = thead;
+  document.querySelector('#mainTable tbody').innerHTML = tbody;
+
+  // Highlight best row
+  const rows = document.querySelectorAll('#mainTable tbody tr');
+  rows.forEach(row => {
+    const cells = row.querySelectorAll('td');
+    if (cells[0] && bestOverall.key.startsWith(cells[0].textContent)) {
+      row.className = 'best-row';
+    }
+  });
+}
+
+function renderAssetTable(data) {
+  let thead = '<tr><th>Asset</th><th>Calls</th><th>Correct</th><th>Wrong</th><th>WAIT</th><th>Accuracy (ex-WAIT)</th></tr>';
+  let tbody = '';
+  for (const [asset, v] of Object.entries(data.byAsset)) {
+    tbody += `<tr><td style="font-weight:600">${asset}</td><td>${v.calls}</td><td style="color:#00D341">${v.correct}</td><td style="color:#ef4444">${v.wrong}</td><td>${v.wait}</td><td class="${accColor(v.accuracyExWait)}">${v.accuracyExWait}%</td></tr>`;
+  }
+  document.querySelector('#assetTable thead').innerHTML = thead;
+  document.querySelector('#assetTable tbody').innerHTML = tbody;
+}
+
+function renderDirTable(data) {
+  let thead = '<tr><th>Direction</th><th>Predicted</th><th>Correct</th><th>Accuracy</th></tr>';
+  let tbody = '';
+  for (const [dir, v] of Object.entries(data.byDirection)) {
+    const arrow = dir === 'UP' ? '↑' : '↓';
+    const color = dir === 'UP' ? '#00D341' : '#ef4444';
+    tbody += `<tr><td style="font-weight:600;color:${color}">${arrow} ${dir}</td><td>${v.predicted}</td><td>${v.correct}</td><td class="${accColor(v.accuracy)}">${v.accuracy}%</td></tr>`;
+  }
+  document.querySelector('#dirTable thead').innerHTML = thead;
+  document.querySelector('#dirTable tbody').innerHTML = tbody;
+}
+
+// --- Downloads ---
+function downloadRaw() {
+  if (!backtestResults) return;
+  const blob = new Blob([JSON.stringify(backtestResults, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `y28-backtest-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+}
+
+function downloadCSV() {
+  if (!backtestResults || !backtestResults.rawResults) return;
+  const headers = ['asset','interval','windowTs','timingPoint','elapsedSeconds','haikuPrediction','actualDirection','correct','priceAtCall','openPrice','closePrice','priceDeltaPct'];
+  let csv = headers.join(',') + '\n';
+  for (const r of backtestResults.rawResults) {
+    csv += headers.map(h => r[h] ?? '').join(',') + '\n';
+  }
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `y28-backtest-${new Date().toISOString().slice(0,10)}.csv`;
+  a.click();
+}
+
+// --- Init ---
+checkAuth();
+
+// Check if a backtest is already running
+if (token) {
+  api('/api/backtest/status').then(r => {
+    if (r.running) {
+      startTime = Date.now();
+      document.getElementById('progressPanel').className = 'progress-panel active';
+      document.getElementById('startBtn').disabled = true;
+      document.getElementById('startBtn').textContent = '⏳ Running...';
+      pollProgress();
+    } else if (r.results) {
+      backtestResults = r.results;
+      renderResults(r.results);
+    }
+  }).catch(() => {});
+}
+</script>
+</body>
+</html>
