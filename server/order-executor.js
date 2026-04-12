@@ -143,7 +143,7 @@ class OrderExecutor {
     // FIX 1: In-memory dedup — synchronous check before any async work
     const dedupKey = `${signal.laneId}:${signal.windowTs}`;
     const currentCount = this._pendingEntries.get(dedupKey) || 0;
-    if (currentCount >= config.stackMaxEntries) {
+    if (currentCount >= 1) {
       console.log(`[executor] BLOCKED in-memory dedup: ${signal.laneId} has ${currentCount} entries in window ${signal.windowTs}`);
       return null;
     }
@@ -152,7 +152,7 @@ class OrderExecutor {
     // Existing DB-level dedup check (safety net)
     if (signal.windowTs) {
       const existingTrades = db.getTrades({ lane_id: signal.laneId, window_start: signal.windowTs });
-      if (existingTrades.length >= 2) {
+      if (existingTrades.length >= 1) {
         console.log(`[executor] BLOCKED duplicate: ${signal.laneId} already has 2 trades in window ${signal.windowTs}`);
         this._pendingEntries.set(dedupKey, (this._pendingEntries.get(dedupKey) || 1) - 1);
         return null;
@@ -245,21 +245,6 @@ class OrderExecutor {
       console.log(`[executor] ASK_CAP_BLOCKED: ${signal.laneId} ask $${askPrice} >= cap $${maxAsk}`);
       this._pendingEntries.set(dedupKey, (this._pendingEntries.get(dedupKey) || 1) - 1);
       return null;
-    }
-
-    // Price range validation based on entry type
-    if (signal.type === 'midpoint') {
-      if (askPrice < config.midpointPriceRange.min || askPrice > config.midpointPriceRange.max) {
-        console.log(`[executor] Ask $${askPrice} outside midpoint range for ${signal.laneId}`);
-        this._pendingEntries.set(dedupKey, (this._pendingEntries.get(dedupKey) || 1) - 1);
-        return null;
-      }
-    } else if (signal.type === 'spread_scalp') {
-      if (askPrice < config.spreadScalpPriceRange.min || askPrice > config.spreadScalpPriceRange.max) {
-        console.log(`[executor] Ask $${askPrice} outside spread scalp range for ${signal.laneId}`);
-        this._pendingEntries.set(dedupKey, (this._pendingEntries.get(dedupKey) || 1) - 1);
-        return null;
-      }
     }
 
     // Calculate shares and cost using real ask price (same logic as superscalp)

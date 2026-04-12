@@ -760,7 +760,7 @@ app.listen(config.port, () => {
 
   const bootSkipLanes = new Set(config.lanes.map(l => l.id));
   // --- v2 lanes (Tier 3/4 DCA) ---
-  const v2Lanes = buildV2Lanes().filter(l => l.interval === 60 || l.interval === 240);
+  const v2Lanes = []; // v2 DCA disabled — 1H/4H now handled by v1 superscalp loop
 
   setTimeout(() => {
     const balance = db.getPoolBalance();
@@ -846,6 +846,12 @@ app.listen(config.port, () => {
                       tradeId: trade.id,
                     });
                     superScalp.activeEntries.set(signal.laneId, entries);
+
+                    // Mark Haiku as executed for this window — prevents re-approval
+                    try {
+                      const { haikuAgent } = require('./haiku-agent');
+                      haikuAgent.markExecuted(signal.laneId, signal.windowTs);
+                    } catch (_) {}
                   }
                 } else {
                   console.log(`[scalp] No market found for ${signal.laneId} window=${signal.windowTs}`);

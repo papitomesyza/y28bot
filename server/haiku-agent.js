@@ -24,8 +24,8 @@ class HaikuAgent {
    * Build OHLC text data for the last N candles of an asset.
    * Uses candleEngine completed candles + live candle.
    */
-  _buildCandleText(asset, interval, windowTs, numCandles = 7) {
-    const laneId = `${asset}-${interval}M`;
+  _buildCandleText(asset, interval, windowTs, numCandles = 7, laneId = null) {
+    if (!laneId) laneId = `${asset}-${interval}M`;
     const candles = [];
 
     // Get completed candles (most recent N)
@@ -67,16 +67,18 @@ class HaikuAgent {
       return null;
     }
 
-    const systemPrompt = `You are a crypto candle pattern analyst. You receive OHLC candle data for ${asset} on a ${interval}-minute timeframe. Your job is to predict the direction of the current candle by the time it closes.
+    const systemPrompt = `You are a crypto momentum analyst. You receive OHLC candle data for ${asset} on a ${interval}-minute timeframe. Your job is to predict whether the current candle will CONTINUE in its current direction or reverse by the time it closes.
 
 Rules:
 - Respond with exactly one word: UP, DOWN, or WAIT
-- UP = price will close higher than current price
-- DOWN = price will close lower than current price
-- WAIT = no clear pattern, skip this candle
-- Look for: momentum direction, lower lows/lower highs (bearish), higher lows/higher highs (bullish), bounce attempts, support/resistance breaks, engulfing patterns, trend continuation vs reversal
-- If the structure is choppy with no clear direction, say WAIT
-- Be decisive. Only say WAIT if genuinely uncertain.`;
+- UP = price will close higher than the candle open
+- DOWN = price will close lower than the candle open
+- WAIT = no clear momentum, skip this candle
+- Focus on: trend strength, momentum persistence, higher highs/higher lows (bullish), lower highs/lower lows (bearish), volume of recent moves, whether the current move is accelerating or decelerating
+- At hourly and 4-hourly timeframes, trends tend to persist (momentum effect)
+- If the move is strong and accelerating, bet on continuation
+- If the move is weak, choppy, or showing signs of exhaustion, say WAIT
+- Be decisive. Only say WAIT if the structure is genuinely ambiguous.`;
 
     const userMessage = `Here are the recent ${interval}-minute candles for ${asset}:\n\n${candleText}\n\nWhat is your prediction for the current candle's close? Reply with exactly one word: UP, DOWN, or WAIT.`;
 
@@ -143,6 +145,10 @@ Rules:
     // Check if we already have a final decision for this window
     const cached = callCache.get(cacheKey);
     if (cached && cached.final) {
+      // If already executed a trade this window, never approve again
+      if (cached.executed) {
+        return { approved: false, direction: null, reason: 'already executed' };
+      }
       return cached.finalResult;
     }
 
@@ -151,7 +157,7 @@ Rules:
 
     if (!confirm) {
       // --- FIRST CALL ---
-      const candleText = this._buildCandleText(asset, interval, windowTs);
+      const candleText = this._buildCandleText(asset, interval, windowTs, 7, laneId);
       if (!candleText) {
         return { approved: false, direction: null, reason: 'no candle data available' };
       }
@@ -194,7 +200,7 @@ Rules:
     }
 
     // --- SECOND CALL ---
-    const candleText2 = this._buildCandleText(asset, interval, windowTs);
+    const candleText2 = this._buildCandleText(asset, interval, windowTs, 7, laneId);
     if (!candleText2) {
       const result = { approved: false, direction: null, reason: 'no candle data for second call' };
       callCache.set(cacheKey, { final: true, finalResult: result });
@@ -230,6 +236,19 @@ Rules:
     callCache.set(cacheKey, { final: true, finalResult: result });
     confirmationState.delete(confirmKey);
     return result;
+  }
+
+  /**
+   * Mark a lane+window as executed so Haiku never re-approves.
+   */
+  markExecuted(laneId, windowTs) {
+    const cacheKey = `${laneId}:${windowTs}`;
+    const cached = callCache.get(cacheKey);
+    if (cached) {
+      cached.executed = true;
+    } else {
+      callCache.set(cacheKey, { final: true, executed: true, finalResult: { approved: false, direction: null, reason: 'already executed' } });
+    }
   }
 
   /**

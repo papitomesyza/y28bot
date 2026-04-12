@@ -11,7 +11,7 @@ function deepFreeze(obj) {
 }
 
 const assets = ['BTC', 'ETH'];
-const intervals = [5, 15];
+const intervals = [5, 15, 60, 240];
 
 const lanes = [];
 for (const asset of assets) {
