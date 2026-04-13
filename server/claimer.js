@@ -92,15 +92,38 @@ class Claimer {
   // ── Data API: single source of truth ──────────────────────────────
 
   /**
+   * Fetch all positions from the Data API with pagination.
+   * The API returns max 100 per page; keeps fetching until fewer than 100 come back.
+   */
+  async _fetchAllPositions(wallet) {
+    const PAGE_SIZE = 100;
+    let allPositions = [];
+    let offset = 0;
+    let pageCount = 0;
+
+    while (true) {
+      const url = `${DATA_API_BASE}/positions?user=${wallet}&limit=${PAGE_SIZE}&offset=${offset}`;
+      const resp = await axios.get(url);
+      const page = Array.isArray(resp.data) ? resp.data : [];
+      pageCount++;
+      allPositions = allPositions.concat(page);
+
+      if (page.length < PAGE_SIZE) break;
+      offset += PAGE_SIZE;
+    }
+
+    console.log(`[claimer] Fetched ${allPositions.length} positions across ${pageCount} pages`);
+    return allPositions;
+  }
+
+  /**
    * Fetch all redeemable positions from the Data API.
    * Filters to: redeemable === true, curPrice === 1 (winners), size > 0.
    */
   async getRedeemablePositions() {
     const wallet = await this.getDataApiWallet();
     try {
-      const resp = await axios.get(`${DATA_API_BASE}/positions?user=${wallet}`);
-      const all = Array.isArray(resp.data) ? resp.data : [];
-      console.log(`[claimer] Data API returned ${all.length} total positions for ${wallet}`);
+      const all = await this._fetchAllPositions(wallet);
 
       // Resolve pending trades using the same Data API positions (no extra API call)
       this.resolveTradesFromOracle(all);
@@ -789,8 +812,7 @@ class Claimer {
     const wallet = await this.getDataApiWallet();
     let allPositions;
     try {
-      const resp = await axios.get(`${DATA_API_BASE}/positions?user=${wallet}`);
-      allPositions = Array.isArray(resp.data) ? resp.data : [];
+      allPositions = await this._fetchAllPositions(wallet);
     } catch (err) {
       console.error('[resolver-oracle] Data API fetch failed:', err.message);
       return;

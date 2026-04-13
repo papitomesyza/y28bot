@@ -33,7 +33,7 @@ const config = deepFreeze({
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || null,
   telegramChatId: process.env.TELEGRAM_CHAT_ID || null,
   startingPoolBalance: 18.57,
-  minPoolBalance: 5,
+  minPoolBalance: 0,
   maxTradeSize: 20,
   maxLossPerTrade: 5,
   minShares: 5,

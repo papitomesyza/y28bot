@@ -30,7 +30,8 @@
       "Bash(node -c server/order-executor.js)",
       "Bash(node -c server/haiku-agent.js)",
       "Bash(node -e \"try { require\\('./server/resolver'\\); console.log\\('resolver.js: OK'\\); } catch\\(e\\) { console.error\\('resolver.js:', e.message\\); }\")",
-      "Bash(node -e \"try { require\\('./server/haiku-agent'\\); console.log\\('haiku-agent.js: OK'\\); } catch\\(e\\) { console.error\\('haiku-agent.js:', e.message\\); }\")"
+      "Bash(node -e \"try { require\\('./server/haiku-agent'\\); console.log\\('haiku-agent.js: OK'\\); } catch\\(e\\) { console.error\\('haiku-agent.js:', e.message\\); }\")",
+      "Bash(node -c server/claimer.js)"
     ]
   }
 }
