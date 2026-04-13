@@ -1,3 +1,5 @@
+process.env.TZ = 'Europe/Belgrade';
+
 const fs = require('fs');
 const path = require('path');
 
@@ -737,6 +739,7 @@ async function syncWalletBalance(verbose) {
 app.listen(config.port, () => {
   const balance = db.getPoolBalance();
   console.log(`[boot] y28 Polymarket Bot started on port ${config.port}`);
+  console.log(`[boot] Timezone: UTC+2 (CEST)`);
   console.log(`[boot] Pool balance: $${balance}`);
 
   console.log('[boot] Coinbase WebSocket connecting...');

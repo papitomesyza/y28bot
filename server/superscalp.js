@@ -191,6 +191,17 @@ class SuperScalp {
       const shareCalc = this.calculateShares(allocation, askPrice);
       if (!shareCalc) return null;
 
+      // Asian off-hours share cap: 22:00–06:00 UTC+2
+      let { shares, cost } = shareCalc;
+      const hour = new Date().getHours();
+      if (hour >= 22 || hour <= 5) {
+        if (shares > 3) {
+          console.log(`[scalp] ${laneId} ASIAN_CAP: shares capped from ${shares} to 3`);
+          shares = 3;
+          cost = 3 * askPrice;
+        }
+      }
+
       console.log(`[scalp] ${laneId} HAIKU ENTRY: ${finalDirection} irrev=${irrev.toFixed(2)} ask=$${askPrice}`);
 
       return {
@@ -201,8 +212,8 @@ class SuperScalp {
         irrev,
         entryPrice: askPrice,
         allocation,
-        shares: shareCalc.shares,
-        cost: shareCalc.cost,
+        shares,
+        cost,
         windowTs,
       };
     } finally {

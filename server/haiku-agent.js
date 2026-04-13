@@ -78,37 +78,48 @@ Rules:
 - At hourly and 4-hourly timeframes, trends tend to persist (momentum effect)
 - If the move is strong and accelerating, bet on continuation
 - If the move is weak, choppy, or showing signs of exhaustion, say WAIT
-- Be decisive. Only say WAIT if the structure is genuinely ambiguous.`;
+- Be decisive. Only say WAIT if the structure is genuinely ambiguous.
+
+CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markdown, no reasoning. Just reply with one word: UP, DOWN, or WAIT. Nothing else.`;
 
     const userMessage = `Here are the recent ${interval}-minute candles for ${asset}:\n\n${candleText}\n\nWhat is your prediction for the current candle's close? Reply with exactly one word: UP, DOWN, or WAIT.`;
 
-    try {
-      const response = await axios.post(API_URL, {
-        model: HAIKU_MODEL,
-        max_tokens: 10,
-        messages: [{ role: 'user', content: userMessage }],
-        system: systemPrompt,
-      }, {
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        timeout: 5000,
-      });
+    const requestBody = {
+      model: HAIKU_MODEL,
+      max_tokens: 10,
+      messages: [{ role: 'user', content: userMessage }],
+      system: systemPrompt,
+    };
+    const requestConfig = {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      timeout: 15000,
+    };
 
-      const text = response.data.content[0].text.trim().toUpperCase();
-
-      if (text === 'UP' || text === 'DOWN' || text === 'WAIT') {
-        return text;
-      }
-
-      // Try to extract from longer response
+    const parseResponse = (resp) => {
+      const text = resp.data.content[0].text.trim().toUpperCase();
+      if (text === 'UP' || text === 'DOWN' || text === 'WAIT') return text;
       if (text.includes('UP')) return 'UP';
       if (text.includes('DOWN')) return 'DOWN';
       if (text.includes('WAIT')) return 'WAIT';
+      return null;
+    };
 
-      console.log(`[haiku-agent] Unexpected response: "${text}"`);
+    try {
+      const response = await axios.post(API_URL, requestBody, requestConfig);
+      const result = parseResponse(response);
+      if (result) return result;
+
+      // First attempt returned unexpected response — retry once
+      console.log(`[haiku-agent] Unexpected response, retrying...`);
+      const retry = await axios.post(API_URL, requestBody, requestConfig);
+      const retryResult = parseResponse(retry);
+      if (retryResult) return retryResult;
+
+      console.log(`[haiku-agent] Unexpected response after retry: "${retry.data.content[0].text.trim()}"`);
       return null;
     } catch (err) {
       console.error(`[haiku-agent] API error: ${err.message}`);
@@ -145,7 +156,14 @@ Rules:
     // Check if we already have a final decision for this window
     const cached = callCache.get(cacheKey);
     if (cached && cached.final) {
-      // If already executed a trade this window, never approve again
+      const logKey = `haiku-cached-${cacheKey}`;
+      const now = Date.now();
+      const lastLog = this._lastLogTime.get(logKey) || 0;
+      if (now - lastLog >= 30000) {
+        this._lastLogTime.set(logKey, now);
+        const reason = cached.executed ? 'already executed' : cached.finalResult.reason;
+        console.log(`[haiku-agent] ${laneId} cached: ${reason}`);
+      }
       if (cached.executed) {
         return { approved: false, direction: null, reason: 'already executed' };
       }
