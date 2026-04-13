@@ -42,7 +42,7 @@ const config = deepFreeze({
   intervals,
   lanes,
   compoundingTiers: [
-    { minBalance: 0, maxBalance: 75, allocation: 0.08 },
+    { minBalance: 0, maxBalance: 75, allocation: 0.25 },
     { minBalance: 75, maxBalance: 150, allocation: 0.10 },
     { minBalance: 150, maxBalance: 300, allocation: 0.12 },
     { minBalance: 300, maxBalance: Infinity, allocation: 0.15 },
