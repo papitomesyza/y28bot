@@ -34,7 +34,7 @@ class SuperScalp {
   }
 
   // --- Allocation sizing ---
-  calculateAllocation(poolBalance, irrev) {
+  calculateAllocation(poolBalance) {
     const tier = config.compoundingTiers.find(
       t => poolBalance >= t.minBalance && poolBalance < t.maxBalance
     );
@@ -42,13 +42,7 @@ class SuperScalp {
 
     let allocation = poolBalance * tier.allocation;
 
-    if (irrev >= config.irrevMultipliers.extreme.threshold) {
-      allocation *= config.irrevMultipliers.extreme.multiplier;
-    } else if (irrev >= config.irrevMultipliers.high.threshold) {
-      allocation *= config.irrevMultipliers.high.multiplier;
-    }
-
-    // Floor: always enough to buy minShares at max midpoint price ($0.55)
+    // Floor: always enough to buy minShares at max ask price ($0.55)
     allocation = Math.max(allocation, config.minShares * 0.55);
 
     // Safety net: never exceed 25% of pool regardless of tier
@@ -73,39 +67,6 @@ class SuperScalp {
       shares: Math.floor(shares),
       cost: Math.floor(shares) * entryPrice,
     };
-  }
-
-  // --- Velocity check ---
-  checkVelocity(asset, direction, seconds = 10) {
-    const arr = volatilityTracker.ticks.get(asset);
-    if (!arr || arr.length < 3) return true;
-
-    const cutoff = Date.now() - seconds * 1000;
-    const recent = arr.filter(t => t.timestamp >= cutoff);
-    if (recent.length < 3) return true;
-
-    const last3 = recent.slice(-3);
-    let consistent = 0;
-    for (let i = 1; i < last3.length; i++) {
-      const diff = last3[i].price - last3[i - 1].price;
-      if (direction === 'UP' && diff >= 0) consistent++;
-      if (direction === 'DOWN' && diff <= 0) consistent++;
-    }
-
-    return consistent >= last3.length - 1;
-  }
-
-  // --- Stack tracking ---
-  getStackLevel(laneId) {
-    const entries = this.activeEntries.get(laneId);
-    return entries ? entries.length : 0;
-  }
-
-  getIrrevThreshold(stackLevel) {
-    const rc = global.runtimeConfig || {};
-    if (stackLevel === 0) return rc.irrevThreshold != null ? rc.irrevThreshold : config.irrevThresholds.base;
-    if (stackLevel === 1) return rc.irrevStack2 != null ? rc.irrevStack2 : config.irrevThresholds.stack2;
-    return rc.irrevStack3 != null ? rc.irrevStack3 : config.irrevThresholds.stack3;
   }
 
   // --- Main evaluation loop (called every second per lane) ---
@@ -148,8 +109,10 @@ class SuperScalp {
       market = await marketDiscovery.findMarket(laneId, windowTs, interval);
     } catch (_) {}
 
+    // Irrev calculated for logging/DB only — does NOT gate anything
     const irrev = this.calculateIrrev(asset, openPrice, currentPrice, remainingSeconds, totalSeconds);
     const direction = this.getDirection(openPrice, currentPrice);
+    const elapsedSec = totalSeconds - remainingSeconds;
 
     // Throttled logging: every 30 seconds per lane
     const now = Date.now();
@@ -159,171 +122,78 @@ class SuperScalp {
       console.log(`[scalp] ${laneId} irrev=${irrev.toFixed(2)} dir=${direction} remaining=${remainingSeconds}s open=$${openPrice}`);
     }
 
-    // === STRATEGY SPLIT BY TIMEFRAME ===
-    const elapsedSec = totalSeconds - remainingSeconds;
+    // === HAIKU AGENT: sole trade decision-maker ===
+    const { haikuAgent } = require('./haiku-agent');
+    const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, elapsedSec);
 
-    if (interval <= 15) {
-      // === 5M / 15M: CONTRARIAN (mean reversion) ===
-      // Academic evidence: crypto has negative return autocorrelation at 5M.
-      // Strategy: if price moved significantly from open, bet on reversal.
-      // We bet AGAINST the current direction — buy the losing side cheap.
-
-      const call1Elapsed = Math.floor(totalSeconds * 0.30);
-
-      // Wait until 30% of candle elapsed before evaluating
-      if (elapsedSec < call1Elapsed) {
-        return null;
-      }
-
-      // Need minimum irrev of 0.5 to confirm a meaningful move happened
-      if (irrev < 0.5) {
-        return null;
-      }
-
-      // Contrarian direction: OPPOSITE of current price movement
-      const contrarianDirection = direction === 'UP' ? 'DOWN' : 'UP';
-
-      // === ATOMIC EXECUTION LOCK ===
-      const lockKey = `${laneId}:${windowTs}`;
-      if (this.executionLock.has(lockKey)) return null;
-      const existingEntries = this.activeEntries.get(laneId) || [];
-      if (existingEntries.length >= 1) return null;
-      this.executionLock.add(lockKey);
-
-      try {
-        if (remainingSeconds <= 10) return null;
-        if (!market) return null;
-
-        const { orderExecutor } = require('./order-executor');
-        const tokenId = contrarianDirection === 'UP' ? market.upTokenId : market.downTokenId;
-        let askPrice = null;
-        if (orderExecutor.initialized && orderExecutor.client) {
-          try { askPrice = await orderExecutor.getOrderbookPrice(tokenId, 'buy'); } catch (_) {}
+    if (!haikuResult.approved) {
+      if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in') && haikuResult.reason !== 'already executed') {
+        const logKey = `haiku-${laneId}`;
+        const lastHaikuLog = this._lastLogTime.get(logKey) || 0;
+        if (now - lastHaikuLog >= 10000) {
+          this._lastLogTime.set(logKey, now);
+          console.log(`[haiku-gate] ${laneId} BLOCKED: ${haikuResult.reason}`);
         }
-        if (askPrice == null) return null;
-
-        // CRITICAL: only enter if the contrarian (losing) side is CHEAP
-        // This is the entire edge — we buy the losing side at $0.30-$0.52
-        // Breakeven at these prices is 30-52% — mean reversion gives us ~52-55%
-        const maxContrarianAsk = 0.52;
-        if (askPrice > maxContrarianAsk) {
-          const logKey = `contra-cap-${laneId}`;
-          const lastCapLog = this._lastLogTime.get(logKey) || 0;
-          if (now - lastCapLog >= 10000) {
-            this._lastLogTime.set(logKey, now);
-            console.log(`[scalp] ${laneId} CONTRARIAN_CAP: losing side $${askPrice} > $${maxContrarianAsk}`);
-          }
-          return null;
-        }
-
-        const poolBalance = db.getPoolBalance();
-        if (poolBalance < config.minPoolBalance) return null;
-
-        const allocation = this.calculateAllocation(poolBalance, irrev);
-        const shareCalc = this.calculateShares(allocation, askPrice);
-        if (!shareCalc) return null;
-
-        console.log(`[scalp] ${laneId} CONTRARIAN ENTRY: bet ${contrarianDirection} (price moved ${direction}) irrev=${irrev.toFixed(2)} ask=$${askPrice}`);
-
-        return {
-          type: 'contrarian',
-          laneId,
-          asset,
-          direction: contrarianDirection,
-          irrev,
-          entryPrice: askPrice,
-          allocation,
-          shares: shareCalc.shares,
-          cost: shareCalc.cost,
-          windowTs,
-        };
-      } finally {
-        this.executionLock.delete(lockKey);
       }
+      return null;
+    }
 
-    } else {
-      // === 1H / 4H: MOMENTUM (Haiku-confirmed) ===
-      // Research: momentum works from 1H+. Use Haiku for pattern reading.
-      // Only enter when Haiku confirms AND shares are affordable.
+    const finalDirection = haikuResult.direction || direction;
 
-      const { haikuAgent } = require('./haiku-agent');
-      const haikuResult = await haikuAgent.evaluate(laneId, asset, interval, windowTs, irrev, elapsedSec);
+    // === ATOMIC EXECUTION LOCK ===
+    const lockKey = `${laneId}:${windowTs}`;
+    if (this.executionLock.has(lockKey)) return null;
+    const existingEntries = this.activeEntries.get(laneId) || [];
+    if (existingEntries.length >= 1) return null;
+    this.executionLock.add(lockKey);
 
-      if (!haikuResult.approved) {
-        if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in') && haikuResult.reason !== 'already executed') {
-          const logKey = `haiku-${laneId}`;
-          const lastHaikuLog = this._lastLogTime.get(logKey) || 0;
-          if (now - lastHaikuLog >= 10000) {
-            this._lastLogTime.set(logKey, now);
-            console.log(`[haiku-gate] ${laneId} BLOCKED: ${haikuResult.reason}`);
-          }
+    try {
+      if (remainingSeconds <= 10) return null;
+      if (!market) return null;
+
+      const { orderExecutor } = require('./order-executor');
+      const tokenId = finalDirection === 'UP' ? market.upTokenId : market.downTokenId;
+      let askPrice = null;
+      if (orderExecutor.initialized && orderExecutor.client) {
+        try { askPrice = await orderExecutor.getOrderbookPrice(tokenId, 'buy'); } catch (_) {}
+      }
+      if (askPrice == null) return null;
+
+      // Max ask $0.55 — breakeven 55%, Haiku accuracy ~64.6%
+      const maxAsk = 0.55;
+      if (askPrice > maxAsk) {
+        const logKey = `ask-cap-${laneId}`;
+        const lastCapLog = this._lastLogTime.get(logKey) || 0;
+        if (now - lastCapLog >= 10000) {
+          this._lastLogTime.set(logKey, now);
+          console.log(`[scalp] ${laneId} ASK_CAP: $${askPrice} > $${maxAsk}`);
         }
         return null;
       }
 
-      const finalDirection = haikuResult.direction || direction;
+      const poolBalance = db.getPoolBalance();
+      if (poolBalance < config.minPoolBalance) return null;
 
-      // === ATOMIC EXECUTION LOCK ===
-      const lockKey = `${laneId}:${windowTs}`;
-      if (this.executionLock.has(lockKey)) return null;
-      const existingEntries = this.activeEntries.get(laneId) || [];
-      if (existingEntries.length >= 1) return null;
-      this.executionLock.add(lockKey);
+      const allocation = this.calculateAllocation(poolBalance);
+      const shareCalc = this.calculateShares(allocation, askPrice);
+      if (!shareCalc) return null;
 
-      try {
-        if (remainingSeconds <= 10) return null;
-        if (!market) return null;
+      console.log(`[scalp] ${laneId} HAIKU ENTRY: ${finalDirection} irrev=${irrev.toFixed(2)} ask=$${askPrice}`);
 
-        // Minimum irrev at execution time — the move must still be alive
-        if (irrev < 0.5) {
-          console.log(`[scalp] ${laneId} IRREV_FLOOR: ${irrev.toFixed(2)} < 0.5 at execution`);
-          return null;
-        }
-
-        const { orderExecutor } = require('./order-executor');
-        const tokenId = finalDirection === 'UP' ? market.upTokenId : market.downTokenId;
-        let askPrice = null;
-        if (orderExecutor.initialized && orderExecutor.client) {
-          try { askPrice = await orderExecutor.getOrderbookPrice(tokenId, 'buy'); } catch (_) {}
-        }
-        if (askPrice == null) return null;
-
-        // Max ask for momentum: $0.65 (breakeven = 65%, achievable with Haiku + momentum regime)
-        const maxMomentumAsk = 0.65;
-        if (askPrice > maxMomentumAsk) {
-          const logKey = `momentum-cap-${laneId}`;
-          const lastCapLog = this._lastLogTime.get(logKey) || 0;
-          if (now - lastCapLog >= 10000) {
-            this._lastLogTime.set(logKey, now);
-            console.log(`[scalp] ${laneId} MOMENTUM_CAP: $${askPrice} > $${maxMomentumAsk}`);
-          }
-          return null;
-        }
-
-        const poolBalance = db.getPoolBalance();
-        if (poolBalance < config.minPoolBalance) return null;
-
-        const allocation = this.calculateAllocation(poolBalance, irrev);
-        const shareCalc = this.calculateShares(allocation, askPrice);
-        if (!shareCalc) return null;
-
-        console.log(`[scalp] ${laneId} HAIKU MOMENTUM: ${finalDirection} irrev=${irrev.toFixed(2)} ask=$${askPrice}`);
-
-        return {
-          type: 'haiku_momentum',
-          laneId,
-          asset,
-          direction: finalDirection,
-          irrev,
-          entryPrice: askPrice,
-          allocation,
-          shares: shareCalc.shares,
-          cost: shareCalc.cost,
-          windowTs,
-        };
-      } finally {
-        this.executionLock.delete(lockKey);
-      }
+      return {
+        type: 'haiku',
+        laneId,
+        asset,
+        direction: finalDirection,
+        irrev,
+        entryPrice: askPrice,
+        allocation,
+        shares: shareCalc.shares,
+        cost: shareCalc.cost,
+        windowTs,
+      };
+    } finally {
+      this.executionLock.delete(lockKey);
     }
   }
 

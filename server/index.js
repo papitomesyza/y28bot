@@ -91,9 +91,6 @@ if (pausedRaw === 'true') {
 
 // Mutable runtime config overlay — modules can check this for live-adjustable settings
 global.runtimeConfig = {
-  irrevThreshold: config.irrevThresholds.base,
-  irrevStack2: config.irrevThresholds.stack2,
-  irrevStack3: config.irrevThresholds.stack3,
   dryRun: config.dryRun,
   laneEnabled: {},
   maxTradeSize: config.maxTradeSize,
@@ -528,7 +525,6 @@ app.get('/api/logs/errors', auth.authMiddleware, (req, res) => {
 // --- Settings ---
 
 const SETTINGS_WHITELIST = [
-  'irrevThreshold', 'irrevStack2', 'irrevStack3',
   'dryRun', 'logLevel', 'laneEnabled',
   'maxTradeSize', 'maxLossPerTrade', 'minShares', 'minPoolBalance',
   'spreadScalpIrrev', 'spreadScalpLastSeconds', 'limitOrderTimeoutMs',
@@ -983,12 +979,7 @@ app.listen(config.port, () => {
             // Haiku brain — runs on proportional schedule, caches result
             const { haikuAgent } = require('./haiku-agent');
             const elapsedSec = (lane.interval * 60) - remainingSeconds;
-            const haikuResult = await haikuAgent.evaluate(lane.id, lane.asset, lane.interval, currentWindowTs,
-              superScalp.calculateIrrev(lane.asset,
-                priceTracker.getOpenPrice(lane.id, lane.interval) || 0,
-                polymarketRTDS.getPrice(lane.asset) || coinbaseWS.getPrice(lane.asset) || 0,
-                remainingSeconds, lane.interval * 60),
-              elapsedSec);
+            const haikuResult = await haikuAgent.evaluate(lane.id, lane.asset, lane.interval, currentWindowTs, elapsedSec);
 
             if (!haikuResult.approved) {
               if (haikuResult.reason !== 'too early in candle' && !haikuResult.reason.startsWith('confirmation in')) {

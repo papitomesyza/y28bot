@@ -159,7 +159,7 @@ class OrderExecutor {
       }
     }
 
-    const maxAsk = global.runtimeConfig.maxAskPrice || 0.92;
+    const maxAsk = global.runtimeConfig.maxAskPrice || 0.55;
 
     // Dry run or not initialized — simulate trade with real prices when possible
     if (!this.initialized || config.dryRun) {
@@ -184,7 +184,7 @@ class OrderExecutor {
           // Recalculate shares/cost with real price
           const poolBalance = db.getPoolBalance();
           const { superScalp } = require('./superscalp');
-          const allocation = superScalp.calculateAllocation(poolBalance, signal.irrev);
+          const allocation = superScalp.calculateAllocation(poolBalance);
           const shareCalc = superScalp.calculateShares(allocation, realAsk);
           const effectiveMin = signal.minShares || config.minShares;
           if (!shareCalc || shareCalc.shares < effectiveMin) {
@@ -250,7 +250,7 @@ class OrderExecutor {
     // Calculate shares and cost using real ask price (same logic as superscalp)
     const poolBalance = db.getPoolBalance();
     const { superScalp } = require('./superscalp');
-    const allocation = superScalp.calculateAllocation(poolBalance, signal.irrev);
+    const allocation = superScalp.calculateAllocation(poolBalance);
     const shareCalc = superScalp.calculateShares(allocation, askPrice);
     if (!shareCalc) {
       console.log(`[executor] Insufficient shares for ${signal.laneId}`);

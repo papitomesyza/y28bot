@@ -27,7 +27,8 @@
       "Bash(node -c server/momentum-gate.js)",
       "Bash(node -c server/coinbase-ws.js)",
       "Bash(node -c server/index.js)",
-      "Bash(node -c server/order-executor.js)"
+      "Bash(node -c server/order-executor.js)",
+      "Bash(node -c server/haiku-agent.js)"
     ]
   }
 }

@@ -11,7 +11,7 @@ function deepFreeze(obj) {
 }
 
 const assets = ['BTC', 'ETH'];
-const intervals = [5, 15, 60, 240];
+const intervals = [5, 15];
 
 const lanes = [];
 for (const asset of assets) {
@@ -33,7 +33,7 @@ const config = deepFreeze({
   telegramBotToken: process.env.TELEGRAM_BOT_TOKEN || null,
   telegramChatId: process.env.TELEGRAM_CHAT_ID || null,
   startingPoolBalance: 18.57,
-  minPoolBalance: 10,
+  minPoolBalance: 5,
   maxTradeSize: 20,
   maxLossPerTrade: 5,
   minShares: 5,

@@ -12,7 +12,7 @@ const API_KEY = process.env.ANTHROPIC_API_KEY;
 const callCache = new Map();
 
 // Confirmation timer tracking
-// Key: `${laneId}:${windowTs}`, Value: { firstDirection, firstCallTime, firstIrrev }
+// Key: `${laneId}:${windowTs}`, Value: { firstDirection, firstCallTime }
 const confirmationState = new Map();
 
 class HaikuAgent {
@@ -129,14 +129,14 @@ Rules:
    *
    * Returns: { approved: boolean, direction: string|null, reason: string }
    */
-  async evaluate(laneId, asset, interval, windowTs, irrev, elapsedSeconds) {
+  async evaluate(laneId, asset, interval, windowTs, elapsedSeconds) {
     const cacheKey = `${laneId}:${windowTs}`;
     const confirmKey = `${laneId}:${windowTs}`;
 
     // Proportional timing based on interval
     const totalSeconds = interval * 60;
-    const call1Elapsed = Math.floor(totalSeconds * 0.30);
-    const call2Elapsed = Math.floor(totalSeconds * 0.40);
+    const call1Elapsed = Math.floor(totalSeconds * 0.40);
+    const call2Elapsed = Math.floor(totalSeconds * 0.50);
 
     if (elapsedSeconds < call1Elapsed) {
       return { approved: false, direction: null, reason: 'too early in candle' };
@@ -167,29 +167,21 @@ Rules:
         return { approved: false, direction: null, reason: 'haiku API failed' };
       }
 
-      console.log(`[haiku-agent] ${laneId} call #1: ${prediction} (irrev=${irrev.toFixed(2)}, elapsed=${elapsedSeconds}s)`);
+      console.log(`[haiku-agent] ${laneId} call #1: ${prediction} (elapsed=${elapsedSeconds}s)`);
 
       if (prediction === 'WAIT') {
-        // Irrev override: if irrev >= 3.0, skip Haiku and approve
-        if (irrev >= 3.0) {
-          console.log(`[haiku-agent] ${laneId} WAIT overridden by irrev=${irrev.toFixed(2)} >= 3.0`);
-          const result = { approved: true, direction: null, reason: 'irrev override (>=3.0), haiku said WAIT' };
-          callCache.set(cacheKey, { final: true, finalResult: result });
-          return result;
-        }
         const result = { approved: false, direction: null, reason: 'haiku says WAIT' };
         callCache.set(cacheKey, { final: true, finalResult: result });
         return result;
       }
 
-      // Record first call, start 30s confirmation timer
+      // Record first call, start confirmation timer
       confirmationState.set(confirmKey, {
         firstDirection: prediction,
         firstCallTime: Date.now(),
-        firstIrrev: irrev,
       });
 
-      return { approved: false, direction: prediction, reason: 'awaiting confirmation (30s)' };
+      return { approved: false, direction: prediction, reason: 'awaiting confirmation' };
     }
 
     // --- CONFIRMATION PHASE ---
@@ -216,21 +208,19 @@ Rules:
       return result;
     }
 
-    console.log(`[haiku-agent] ${laneId} call #2: ${prediction2} (irrev=${irrev.toFixed(2)}, first was ${confirm.firstDirection})`);
+    console.log(`[haiku-agent] ${laneId} call #2: ${prediction2} (first was ${confirm.firstDirection})`);
 
-    // Check: second call matches first AND irrev rose
-    if (prediction2 === confirm.firstDirection && irrev >= confirm.firstIrrev) {
-      console.log(`[haiku-agent] ${laneId} CONFIRMED: ${prediction2} (irrev ${confirm.firstIrrev.toFixed(2)} → ${irrev.toFixed(2)})`);
+    // Check: second call matches first direction
+    if (prediction2 === confirm.firstDirection) {
+      console.log(`[haiku-agent] ${laneId} CONFIRMED: ${prediction2}`);
       const result = { approved: true, direction: prediction2, reason: 'haiku confirmed' };
       callCache.set(cacheKey, { final: true, finalResult: result });
       confirmationState.delete(confirmKey);
       return result;
     }
 
-    // Disagreement or irrev dropped
-    const reason = prediction2 !== confirm.firstDirection
-      ? `haiku disagreed (${confirm.firstDirection} → ${prediction2})`
-      : `irrev dropped (${confirm.firstIrrev.toFixed(2)} → ${irrev.toFixed(2)})`;
+    // Direction disagreement
+    const reason = `haiku disagreed (${confirm.firstDirection} → ${prediction2})`;
     console.log(`[haiku-agent] ${laneId} REJECTED: ${reason}`);
     const result = { approved: false, direction: null, reason };
     callCache.set(cacheKey, { final: true, finalResult: result });
