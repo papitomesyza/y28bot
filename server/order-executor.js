@@ -258,7 +258,15 @@ class OrderExecutor {
       return null;
     }
 
-    const shares = Math.floor(shareCalc.shares);
+    let shares = Math.floor(shareCalc.shares);
+
+    // Respect signal share cap (Asian off-hours / Daily Boundary)
+    if (signal.shares && signal.shares > 0 && shares > signal.shares) {
+      const recalculated = shares;
+      shares = signal.shares;
+      console.log(`[executor] SIGNAL_CAP: ${signal.laneId} shares capped from ${recalculated} to ${signal.shares} (signal limit)`);
+    }
+
     const effectiveMinShares = signal.minShares || config.minShares;
     if (shares < effectiveMinShares) {
       console.log(`[executor] Shares ${shares} below minimum ${effectiveMinShares} for ${signal.laneId}`);
@@ -329,7 +337,7 @@ class OrderExecutor {
     }
 
     // Record trade in DB and deduct cost from pool
-    const cost = fillShares * fillPrice;
+    let cost = fillShares * fillPrice;
     const liveConditionId = market.conditionId || null;
     const tradeId = db.insertTrade({
       lane_id: signal.laneId,

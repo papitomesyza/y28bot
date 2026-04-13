@@ -191,14 +191,35 @@ class SuperScalp {
       const shareCalc = this.calculateShares(allocation, askPrice);
       if (!shareCalc) return null;
 
-      // Asian off-hours share cap: 22:00–06:00 UTC+2
       let { shares, cost } = shareCalc;
       const hour = new Date().getHours();
+
       if (hour >= 22 || hour <= 5) {
+        // Regime 1 — Asian off-hours share cap
         if (shares > 3) {
-          console.log(`[scalp] ${laneId} ASIAN_CAP: shares capped from ${shares} to 3`);
+          const originalShares = shares;
           shares = 3;
           cost = 3 * askPrice;
+          console.log(`[scalp] ${laneId} ASIAN_CAP: shares capped from ${originalShares} to 3`);
+        }
+      } else if (hour >= 6 && hour <= 21) {
+        // Regime 2 — Active hours: Daily Boundaries share cap
+        const todayMidnight = new Date();
+        todayMidnight.setHours(0, 0, 0, 0);
+        const todayISO = todayMidnight.toISOString();
+        const row = db.getDb().prepare(`SELECT COUNT(*) AS cnt FROM trades WHERE result = 'lost' AND created_at >= ?`).get(todayISO);
+        const todayLosses = row ? row.cnt : 0;
+
+        let capLimit = null;
+        if (todayLosses >= 8) capLimit = 2;
+        else if (todayLosses >= 6) capLimit = 4;
+        else if (todayLosses >= 4) capLimit = 6;
+
+        if (capLimit !== null && shares > capLimit) {
+          const originalShares = shares;
+          shares = capLimit;
+          cost = shares * askPrice;
+          console.log(`[scalp] ${laneId} DAILY_BOUNDARY: ${todayLosses} losses today, shares capped from ${originalShares} to ${shares}`);
         }
       }
 
