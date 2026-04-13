@@ -207,7 +207,7 @@ app.get('/api/superscalp/status', auth.authMiddleware, (req, res) => {
       irrev: parseFloat(irrev.toFixed(3)),
       direction,
       remainingSeconds,
-      stackLevel: superScalp.getStackLevel(lane.id),
+      stackLevel: 0,
       volatility: volatilityTracker.getVolatility(lane.asset),
     };
   }
@@ -418,7 +418,7 @@ app.get('/api/status', auth.authMiddleware, (req, res) => {
       irrev: parseFloat(irrev.toFixed(3)),
       direction,
       remainingSeconds,
-      stackLevel: superScalp.getStackLevel(lane.id),
+      stackLevel: 0,
       volatility: volatilityTracker.getVolatility(lane.asset),
     };
   });
@@ -769,8 +769,8 @@ app.listen(config.port, () => {
   // Start resolver pending-trade safety net
   resolver.start();
 
-  // Start oracle trade resolver (Data API as single source of truth for win/loss)
-  claimer.startOracleResolver();
+  // Start oracle trade resolver (Data API as single source of truth for win/loss, paginated)
+  resolver.startOracleResolver();
 
   // --- Daily pool balance snapshot for "yesterday" comparison ---
   let lastSnapshotDate = db.getSetting('poolBalanceDate');
@@ -885,11 +885,7 @@ app.listen(config.port, () => {
                     });
                     superScalp.activeEntries.set(signal.laneId, entries);
 
-                    // Mark Haiku as executed for this window — prevents re-approval
-                    try {
-                      const { haikuAgent } = require('./haiku-agent');
-                      haikuAgent.markExecuted(signal.laneId, signal.windowTs);
-                    } catch (_) {}
+                    // Haiku marks itself as executed on approval — no external call needed
                   }
                 } else {
                   console.log(`[scalp] No market found for ${signal.laneId} window=${signal.windowTs}`);

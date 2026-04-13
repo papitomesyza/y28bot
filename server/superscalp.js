@@ -159,7 +159,20 @@ class SuperScalp {
       }
       if (askPrice == null) return null;
 
-      // Max ask $0.55 — breakeven 55%, Haiku accuracy ~64.6%
+      // Valid entry range: $0.40–$0.55
+      // Below $0.40 = market strongly disagrees with Haiku — skip
+      const minAsk = 0.40;
+      if (askPrice < minAsk) {
+        const logKey = `ask-floor-${laneId}`;
+        const lastFloorLog = this._lastLogTime.get(logKey) || 0;
+        if (now - lastFloorLog >= 10000) {
+          this._lastLogTime.set(logKey, now);
+          console.log(`[scalp] ${laneId} ASK_FLOOR: $${askPrice} < $${minAsk}`);
+        }
+        return null;
+      }
+
+      // Above $0.55 = breakeven too high — skip
       const maxAsk = 0.55;
       if (askPrice > maxAsk) {
         const logKey = `ask-cap-${laneId}`;

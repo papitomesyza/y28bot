@@ -214,7 +214,8 @@ Rules:
     if (prediction2 === confirm.firstDirection) {
       console.log(`[haiku-agent] ${laneId} CONFIRMED: ${prediction2}`);
       const result = { approved: true, direction: prediction2, reason: 'haiku confirmed' };
-      callCache.set(cacheKey, { final: true, finalResult: result });
+      // Mark executed immediately — one approval per lane per window, period
+      callCache.set(cacheKey, { final: true, executed: true, finalResult: result });
       confirmationState.delete(confirmKey);
       return result;
     }

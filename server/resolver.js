@@ -1,13 +1,19 @@
+const axios = require('axios');
 const db = require('./db');
+const config = require('./config');
 const { priceTracker } = require('./price-tracker');
 const { coinbaseWS } = require('./coinbase-ws');
 const { getChainlinkPrice } = require('./chainlink');
 const { polymarketRTDS } = require('./polymarket-ws');
 const positionManager = require('./position-manager');
+const notifications = require('./notifications');
+const { spreadScalp } = require('./spread-scalp');
 
+const DATA_API_BASE = 'https://data-api.polymarket.com';
 const CLEANUP_AGE_MS = 60 * 60 * 1000; // 1 hour
 const PENDING_CHECK_INTERVAL_MS = 60 * 1000; // 1 minute
 const EXPIRY_AGE_S = 15 * 60; // 15 minutes in seconds
+const PAGE_SIZE = 100;
 
 class Resolver {
   constructor() {
@@ -142,6 +148,102 @@ class Resolver {
     }
   }
 
+  /**
+   * Fetch all positions from the Data API with pagination.
+   * The API returns max 100 per page; keep fetching until fewer than 100 come back.
+   */
+  async _fetchAllPositions(wallet) {
+    let allPositions = [];
+    let offset = 0;
+    let pageCount = 0;
+
+    while (true) {
+      const url = `${DATA_API_BASE}/positions?user=${wallet}&limit=${PAGE_SIZE}&offset=${offset}`;
+      const resp = await axios.get(url);
+      const page = Array.isArray(resp.data) ? resp.data : [];
+      pageCount++;
+      allPositions = allPositions.concat(page);
+
+      if (page.length < PAGE_SIZE) break;
+      offset += PAGE_SIZE;
+    }
+
+    console.log(`[resolver-oracle] Fetched ${allPositions.length} positions across ${pageCount} pages`);
+    return allPositions;
+  }
+
+  /**
+   * Poll the Data API for all positions (paginated) and resolve pending trades.
+   * curPrice === 1 → token won, curPrice === 0 → token lost.
+   * curPrice between 0 and 1 → oracle hasn't resolved yet, skip.
+   */
+  async resolveOracleTrades() {
+    const wallet = config.walletAddress;
+    let allPositions;
+    try {
+      allPositions = await this._fetchAllPositions(wallet);
+    } catch (err) {
+      console.error('[resolver-oracle] Data API fetch failed:', err.message);
+      return;
+    }
+
+    const pendingTrades = db.getTrades({ result: 'pending' });
+    if (pendingTrades.length === 0) return;
+
+    console.log(`[resolver-oracle] Checking ${pendingTrades.length} pending trade(s) against ${allPositions.length} Data API positions`);
+
+    for (const trade of pendingTrades) {
+      if (!trade.clob_token_id) continue;
+
+      // Match by clob_token_id (exact token match)
+      const matched = allPositions.find(p => p.asset === trade.clob_token_id);
+      if (!matched) continue;
+
+      const curPrice = parseFloat(matched.curPrice);
+
+      if (curPrice === 1) {
+        const pnl = (trade.shares * 1.0) - trade.cost;
+        db.updateTrade(trade.id, { result: 'won', pnl });
+        db.updatePoolBalance(db.getPoolBalance() + pnl);
+        notifications.tradeResult({ ...trade, result: 'won', pnl }, db.getPoolBalance());
+        console.log(`[resolver-oracle] Trade #${trade.id} ${trade.lane_id} resolved via Data API: won pnl=$${pnl.toFixed(2)}`);
+      } else if (curPrice === 0) {
+        const pnl = -trade.cost;
+        db.updateTrade(trade.id, { result: 'lost', pnl });
+        db.updatePoolBalance(db.getPoolBalance() + pnl);
+
+        if (trade.entry_type === 'spread_scalp') {
+          spreadScalp.recordLoss();
+        }
+
+        notifications.tradeResult({ ...trade, result: 'lost', pnl }, db.getPoolBalance());
+        this._checkAutoPause();
+        console.log(`[resolver-oracle] Trade #${trade.id} ${trade.lane_id} resolved via Data API: lost pnl=$${pnl.toFixed(2)}`);
+      }
+      // curPrice between 0 and 1 — oracle hasn't resolved yet, skip
+    }
+  }
+
+  _checkAutoPause() {
+    const raw = db.getDb();
+    const last3 = raw.prepare("SELECT result FROM trades WHERE result IN ('won','lost') ORDER BY id DESC LIMIT 3").all();
+    if (last3.length === 3 && last3.every(t => t.result === 'lost')) {
+      db.setSetting('paused', 'true');
+      global.botPaused = true;
+      console.log('[bot] \u26A0 AUTO-PAUSED: 3 consecutive losses detected');
+      notifications.send('\u26A0 AUTO-PAUSED: 3 consecutive losses. Review and resume manually.');
+    }
+  }
+
+  startOracleResolver() {
+    this._oracleTimer = setInterval(() => {
+      this.resolveOracleTrades().catch(err => {
+        console.error('[resolver-oracle] Error:', err.message);
+      });
+    }, 60000);
+    console.log('[resolver-oracle] Oracle trade resolver started (60s interval, paginated)');
+  }
+
   start() {
     this._pendingTimer = setInterval(() => this.resolvePending(), PENDING_CHECK_INTERVAL_MS);
     console.log('[resolver] Pending trade scanner started (60s interval)');
@@ -151,6 +253,10 @@ class Resolver {
     if (this._pendingTimer) {
       clearInterval(this._pendingTimer);
       this._pendingTimer = null;
+    }
+    if (this._oracleTimer) {
+      clearInterval(this._oracleTimer);
+      this._oracleTimer = null;
     }
   }
 }
