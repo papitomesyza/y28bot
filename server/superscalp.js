@@ -211,8 +211,8 @@ class SuperScalp {
         const todayLosses = row ? row.cnt : 0;
 
         let capLimit = null;
-        if (todayLosses >= 8) capLimit = 2;
-        else if (todayLosses >= 6) capLimit = 4;
+        if (todayLosses >= 8) capLimit = 3;
+        else if (todayLosses >= 6) capLimit = 5;
         else if (todayLosses >= 4) capLimit = 6;
 
         if (capLimit !== null && shares > capLimit) {
