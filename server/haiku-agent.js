@@ -2,8 +2,6 @@ const axios = require('axios');
 const { candleEngine } = require('./candle-engine');
 const { coinbaseWS } = require('./coinbase-ws');
 const { polymarketRTDS } = require('./polymarket-ws');
-const { priceTracker } = require('./price-tracker');
-const db = require('./db');
 
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 const API_URL = 'https://api.anthropic.com/v1/messages';
@@ -20,13 +18,14 @@ const confirmationState = new Map();
 class HaikuAgent {
   constructor() {
     this._lastLogTime = new Map();
+    this._inFlight = new Set();
   }
 
   /**
    * Build OHLC text data for the last N candles of an asset.
    * Uses candleEngine completed candles + live candle.
    */
-  _buildCandleText(asset, interval, windowTs, numCandles = 7, laneId = null, context = null) {
+  _buildCandleText(asset, interval, windowTs, numCandles = 7, laneId = null) {
     if (!laneId) laneId = `${asset}-${interval}M`;
     const candles = [];
 
@@ -56,20 +55,6 @@ class HaikuAgent {
       candles.push(`LIVE: price=${livePrice.toFixed(2)} [no candle data yet]`);
     }
 
-    if (context) {
-      candles.push('');
-      candles.push('WINDOW CONTEXT:');
-      if (context.openPrice != null) candles.push(`Resolution open: $${context.openPrice.toFixed(2)} (the Chainlink open price that determines UP or DOWN)`);
-      if (context.currentPrice != null) candles.push(`Current price: $${context.currentPrice.toFixed(2)}`);
-      if (context.openPrice != null && context.currentPrice != null) {
-        const deltaPct = ((context.currentPrice - context.openPrice) / context.openPrice * 100).toFixed(4);
-        const deltaLabel = parseFloat(deltaPct) > 0 ? 'above open' : parseFloat(deltaPct) < 0 ? 'below open' : 'flat';
-        candles.push(`Delta from open: ${deltaPct}% (${deltaLabel})`);
-      }
-      if (context.remainingSeconds != null && context.totalSeconds != null) candles.push(`Time remaining: ${context.remainingSeconds}s of ${context.totalSeconds}s`);
-      if (context.todayWins != null && context.todayLosses != null) candles.push(`Today's session: ${context.todayWins}W ${context.todayLosses}L`);
-    }
-
     if (candles.length === 0) return null;
     return candles.join('\n');
   }
@@ -95,11 +80,6 @@ Rules:
 - If the move is strong and accelerating, bet on continuation
 - If the move is weak, choppy, or showing signs of exhaustion, say WAIT
 - Be decisive. Only say WAIT if the structure is genuinely ambiguous.
-- You will also receive WINDOW CONTEXT with the resolution open price, current delta, time remaining, and today's session record.
-- The market resolves UP if final price is above the resolution open price, DOWN if below. This is the only thing that matters for the outcome.
-- A tiny delta (under 0.05%) with more than 120 seconds remaining is a coin flip — prefer WAIT.
-- If time remaining is under 60 seconds and delta is large (over 0.10%), the move is likely locked in — bet on continuation.
-- If today's session has many losses, be more selective — only call UP or DOWN on strong clear setups.
 
 CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markdown, no reasoning. Just reply with one word: UP, DOWN, or WAIT. Nothing else.`;
 
@@ -150,27 +130,24 @@ CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markd
 
   /**
    * Main gate check — called before any trade entry.
-   * Implements the two-call confirmation flow:
+   * Single-call flow at 50% elapsed with DOWN skepticism bias:
    *
-   * 1. First call at ~90s elapsed → returns UP/DOWN/WAIT
-   * 2. If WAIT → skip (unless irrev >= 3.0 override)
-   * 3. If UP/DOWN → cache direction, return { approved: false, pending: true }
-   * 4. After 30s → second call
-   * 5. If second matches first AND irrev rose → approved
-   * 6. If disagreement or irrev dropped → skip
+   * 1. At 50% elapsed → one Haiku call
+   * 2. WAIT → final skip
+   * 3. UP → immediately approved
+   * 4. DOWN → delayed until 55% elapsed (skepticism bias)
    *
    * Returns: { approved: boolean, direction: string|null, reason: string }
    */
   async evaluate(laneId, asset, interval, windowTs, elapsedSeconds) {
     const cacheKey = `${laneId}:${windowTs}`;
-    const confirmKey = `${laneId}:${windowTs}`;
 
     // Proportional timing based on interval
     const totalSeconds = interval * 60;
-    const call1Elapsed = Math.floor(totalSeconds * 0.40);
-    const call2Elapsed = Math.floor(totalSeconds * 0.50);
+    const callElapsed = Math.floor(totalSeconds * 0.50);
+    const downThreshold = Math.floor(totalSeconds * 0.55);
 
-    if (elapsedSeconds < call1Elapsed) {
+    if (elapsedSeconds < callElapsed) {
       return { approved: false, direction: null, reason: 'too early in candle' };
     }
 
@@ -191,128 +168,60 @@ CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markd
       return cached.finalResult;
     }
 
-    // Check confirmation state
-    const confirm = confirmationState.get(confirmKey);
-
-    if (!confirm) {
-      // --- FIRST CALL ---
-      // Build window context for Haiku
-      let context = null;
-      const openPrice = priceTracker.getOpenPrice(laneId, interval);
-      let currentPrice = polymarketRTDS.getPrice(asset);
-      if (currentPrice == null || polymarketRTDS.isStale()) {
-        currentPrice = coinbaseWS.getPrice(asset);
-      }
-      if (openPrice != null && currentPrice != null) {
-        const remainingSeconds = priceTracker.getRemainingSeconds(interval);
-        const totalSeconds = interval * 60;
-        let todayWins = 0;
-        let todayLosses = 0;
-        try {
-          const todayMidnight = new Date();
-          todayMidnight.setHours(0, 0, 0, 0);
-          const midnightISO = todayMidnight.toISOString();
-          todayWins = db.getDb().prepare("SELECT COUNT(*) as cnt FROM trades WHERE result = 'won' AND created_at >= ?").get(midnightISO).cnt;
-          todayLosses = db.getDb().prepare("SELECT COUNT(*) as cnt FROM trades WHERE result = 'lost' AND created_at >= ?").get(midnightISO).cnt;
-        } catch (e) {
-          todayWins = 0;
-          todayLosses = 0;
-        }
-        context = { openPrice, currentPrice, remainingSeconds, totalSeconds, todayWins, todayLosses };
-      }
-      const candleText = this._buildCandleText(asset, interval, windowTs, 7, laneId, context);
-      if (!candleText) {
-        return { approved: false, direction: null, reason: 'no candle data available' };
-      }
-
-      const prediction = await this._callHaiku(asset, interval, candleText);
-      if (prediction == null) {
-        return { approved: false, direction: null, reason: 'haiku API failed' };
-      }
-
-      console.log(`[haiku-agent] ${laneId} call #1: ${prediction} (elapsed=${elapsedSeconds}s)`);
-
-      if (prediction === 'WAIT') {
-        const result = { approved: false, direction: null, reason: 'haiku says WAIT' };
-        callCache.set(cacheKey, { final: true, finalResult: result });
+    // Check for a pending DOWN prediction waiting for 55% elapsed
+    const pending = confirmationState.get(cacheKey);
+    if (pending && pending.type === 'down_delay') {
+      if (elapsedSeconds >= downThreshold) {
+        console.log(`[haiku-agent] ${laneId} DOWN approved at ${elapsedSeconds}s (>= ${downThreshold}s threshold)`);
+        const result = { approved: true, direction: 'DOWN', reason: 'haiku DOWN (delayed)' };
+        callCache.set(cacheKey, { final: true, executed: true, finalResult: result });
+        confirmationState.delete(cacheKey);
         return result;
       }
-
-      // Record first call, start confirmation timer
-      confirmationState.set(confirmKey, {
-        firstDirection: prediction,
-        firstCallTime: Date.now(),
-      });
-
-      return { approved: false, direction: prediction, reason: 'awaiting confirmation' };
+      return { approved: false, direction: 'DOWN', reason: `DOWN requires ${downThreshold - elapsedSeconds}s more` };
     }
 
-    // --- CONFIRMATION PHASE ---
-    const confirmGapMs = (call2Elapsed - call1Elapsed) * 1000;
-    const elapsed = Date.now() - confirm.firstCallTime;
-    if (elapsed < confirmGapMs) {
-      return { approved: false, direction: confirm.firstDirection, reason: `confirmation in ${Math.ceil((confirmGapMs - elapsed) / 1000)}s` };
+    // In-flight lock — prevent duplicate API calls from the 1s loop
+    if (this._inFlight.has(cacheKey)) {
+      return { approved: false, direction: null, reason: 'haiku call in progress' };
     }
 
-    // --- SECOND CALL ---
-    // Build fresh window context for second call
-    let context2 = null;
-    const openPrice2 = priceTracker.getOpenPrice(laneId, interval);
-    let currentPrice2 = polymarketRTDS.getPrice(asset);
-    if (currentPrice2 == null || polymarketRTDS.isStale()) {
-      currentPrice2 = coinbaseWS.getPrice(asset);
+    // --- SINGLE HAIKU CALL ---
+    const candleText = this._buildCandleText(asset, interval, windowTs, 7, laneId);
+    if (!candleText) {
+      return { approved: false, direction: null, reason: 'no candle data available' };
     }
-    if (openPrice2 != null && currentPrice2 != null) {
-      const remainingSeconds2 = priceTracker.getRemainingSeconds(interval);
-      const totalSeconds2 = interval * 60;
-      let todayWins2 = 0;
-      let todayLosses2 = 0;
-      try {
-        const todayMidnight2 = new Date();
-        todayMidnight2.setHours(0, 0, 0, 0);
-        const midnightISO2 = todayMidnight2.toISOString();
-        todayWins2 = db.getDb().prepare("SELECT COUNT(*) as cnt FROM trades WHERE result = 'won' AND created_at >= ?").get(midnightISO2).cnt;
-        todayLosses2 = db.getDb().prepare("SELECT COUNT(*) as cnt FROM trades WHERE result = 'lost' AND created_at >= ?").get(midnightISO2).cnt;
-      } catch (e) {
-        todayWins2 = 0;
-        todayLosses2 = 0;
-      }
-      context2 = { openPrice: openPrice2, currentPrice: currentPrice2, remainingSeconds: remainingSeconds2, totalSeconds: totalSeconds2, todayWins: todayWins2, todayLosses: todayLosses2 };
+
+    this._inFlight.add(cacheKey);
+    const prediction = await this._callHaiku(asset, interval, candleText);
+
+    if (prediction == null) {
+      this._inFlight.delete(cacheKey);
+      return { approved: false, direction: null, reason: 'haiku API failed' };
     }
-    const candleText2 = this._buildCandleText(asset, interval, windowTs, 7, laneId, context2);
-    if (!candleText2) {
-      const result = { approved: false, direction: null, reason: 'no candle data for second call' };
+
+    console.log(`[haiku-agent] ${laneId} prediction: ${prediction} (elapsed=${elapsedSeconds}s)`);
+
+    if (prediction === 'WAIT') {
+      const result = { approved: false, direction: null, reason: 'haiku says WAIT' };
       callCache.set(cacheKey, { final: true, finalResult: result });
-      confirmationState.delete(confirmKey);
+      this._inFlight.delete(cacheKey);
       return result;
     }
 
-    const prediction2 = await this._callHaiku(asset, interval, candleText2);
-    if (prediction2 == null) {
-      const result = { approved: false, direction: null, reason: 'haiku API failed on second call' };
-      callCache.set(cacheKey, { final: true, finalResult: result });
-      confirmationState.delete(confirmKey);
-      return result;
+    // DOWN skepticism — require 55% elapsed before acting
+    if (prediction === 'DOWN' && elapsedSeconds < downThreshold) {
+      console.log(`[haiku-agent] ${laneId} DOWN at ${elapsedSeconds}s, delaying until ${downThreshold}s`);
+      confirmationState.set(cacheKey, { firstDirection: 'DOWN', type: 'down_delay' });
+      this._inFlight.delete(cacheKey);
+      return { approved: false, direction: 'DOWN', reason: `DOWN requires 55% elapsed` };
     }
 
-    console.log(`[haiku-agent] ${laneId} call #2: ${prediction2} (first was ${confirm.firstDirection})`);
-
-    // Check: second call matches first direction
-    if (prediction2 === confirm.firstDirection) {
-      console.log(`[haiku-agent] ${laneId} CONFIRMED: ${prediction2}`);
-      const result = { approved: true, direction: prediction2, reason: 'haiku confirmed' };
-      // Mark executed immediately — one approval per lane per window, period
-      callCache.set(cacheKey, { final: true, executed: true, finalResult: result });
-      confirmationState.delete(confirmKey);
-      return result;
-    }
-
-    // Direction disagreement
-    const reason = `haiku disagreed (${confirm.firstDirection} → ${prediction2})`;
-    console.log(`[haiku-agent] ${laneId} REJECTED: ${reason}`);
-    const result = { approved: false, direction: null, reason };
-    callCache.set(cacheKey, { final: true, finalResult: result });
-    confirmationState.delete(confirmKey);
+    // UP or DOWN past threshold — approve immediately
+    console.log(`[haiku-agent] ${laneId} APPROVED: ${prediction}`);
+    const result = { approved: true, direction: prediction, reason: `haiku ${prediction}` };
+    callCache.set(cacheKey, { final: true, executed: true, finalResult: result });
+    this._inFlight.delete(cacheKey);
     return result;
   }
 
@@ -351,8 +260,9 @@ CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markd
       states.push({ key, ...val });
     }
     return {
-      pendingConfirmations: states,
+      pendingDownDelays: states,
       cachedDecisions: callCache.size,
+      inFlightCalls: this._inFlight.size,
       apiKeySet: !!API_KEY,
     };
   }
