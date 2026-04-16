@@ -25,7 +25,7 @@ class HaikuAgent {
    * Build OHLC text data for the last N candles of an asset.
    * Uses candleEngine completed candles + live candle.
    */
-  _buildCandleText(asset, interval, windowTs, numCandles = 7, laneId = null) {
+  _buildCandleText(asset, interval, windowTs, numCandles = 20, laneId = null) {
     if (!laneId) laneId = `${asset}-${interval}M`;
     const candles = [];
 
@@ -187,7 +187,7 @@ CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markd
     }
 
     // --- SINGLE HAIKU CALL ---
-    const candleText = this._buildCandleText(asset, interval, windowTs, 7, laneId);
+    const candleText = this._buildCandleText(asset, interval, windowTs, 20, laneId);
     if (!candleText) {
       return { approved: false, direction: null, reason: 'no candle data available' };
     }

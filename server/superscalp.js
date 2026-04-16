@@ -159,9 +159,9 @@ class SuperScalp {
       }
       if (askPrice == null) return null;
 
-      // Valid entry range: $0.40–$0.55
-      // Below $0.40 = market strongly disagrees with Haiku — skip
-      const minAsk = 0.40;
+      // Valid entry range: $0.43–$0.55
+      // Below $0.43 = market strongly disagrees with Haiku — skip
+      const minAsk = 0.43;
       if (askPrice < minAsk) {
         const logKey = `ask-floor-${laneId}`;
         const lastFloorLog = this._lastLogTime.get(logKey) || 0;
@@ -207,7 +207,14 @@ class SuperScalp {
         const todayMidnight = new Date();
         todayMidnight.setHours(0, 0, 0, 0);
         const todayISO = todayMidnight.toISOString();
-        const row = db.getDb().prepare(`SELECT COUNT(*) AS cnt FROM trades WHERE result = 'lost' AND created_at >= ?`).get(todayISO);
+        let effectiveLowerBound = todayISO;
+        try {
+          const watermarkRow = db.getDb().prepare("SELECT value FROM settings WHERE key = 'daily_boundary_reset_watermark'").get();
+          effectiveLowerBound = watermarkRow && watermarkRow.value > todayISO ? watermarkRow.value : todayISO;
+        } catch (_) {
+          effectiveLowerBound = todayISO;
+        }
+        const row = db.getDb().prepare(`SELECT COUNT(*) AS cnt FROM trades WHERE result = 'lost' AND created_at >= ?`).get(effectiveLowerBound);
         const todayLosses = row ? row.cnt : 0;
 
         let capLimit = null;

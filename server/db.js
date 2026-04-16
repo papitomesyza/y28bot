@@ -138,6 +138,15 @@ if (!fixFalseWinsV2) {
   console.log('[db] Corrected trades #9 and #10 from won to lost (Chainlink Data Streams resolved opposite direction)');
 }
 
+// One-time: set Daily Boundary reset watermark so today's prior losses no longer cap shares
+const dailyBoundaryReset = db.prepare("SELECT value FROM settings WHERE key = 'daily_boundary_reset_apr16'").get();
+if (!dailyBoundaryReset) {
+  const watermark = new Date().toISOString();
+  db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('daily_boundary_reset_watermark', ?, CURRENT_TIMESTAMP)").run(watermark);
+  db.prepare("INSERT INTO settings (key, value, updated_at) VALUES ('daily_boundary_reset_apr16', '1', CURRENT_TIMESTAMP)").run();
+  console.log(`[db] Daily Boundary reset watermark set to ${watermark}`);
+}
+
 // --- v2 schema: candle_positions table ---
 db.exec(`
   CREATE TABLE IF NOT EXISTS candle_positions (
