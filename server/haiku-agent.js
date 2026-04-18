@@ -123,7 +123,11 @@ CRITICAL: Your response must be ONLY one word. No analysis, no headers, no markd
       console.log(`[haiku-agent] Unexpected response after retry: "${retry.data.content[0].text.trim()}"`);
       return null;
     } catch (err) {
-      console.error(`[haiku-agent] API error: ${err.message}`);
+      if (err.response) {
+        console.error(`[haiku-agent] API error: ${err.message} | status=${err.response.status} | body=${JSON.stringify(err.response.data)}`);
+      } else {
+        console.error(`[haiku-agent] API error: ${err.message}`);
+      }
       return null;
     }
   }

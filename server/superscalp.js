@@ -42,7 +42,7 @@ class SuperScalp {
 
     let allocation = poolBalance * tier.allocation;
 
-    // Floor: always enough to buy minShares at max ask price ($0.55)
+    // Floor: allocation sizing assumption ($0.55 — separate from ASK_CAP, intentionally unchanged)
     allocation = Math.max(allocation, config.minShares * 0.55);
 
     // Safety net: never exceed 25% of pool regardless of tier
@@ -159,9 +159,9 @@ class SuperScalp {
       }
       if (askPrice == null) return null;
 
-      // Valid entry range: $0.43–$0.55
-      // Below $0.43 = market strongly disagrees with Haiku — skip
-      const minAsk = 0.43;
+      // Valid entry range: $0.40–$0.56
+      // Below $0.40 = market strongly disagrees with Haiku — skip
+      const minAsk = 0.40;
       if (askPrice < minAsk) {
         const logKey = `ask-floor-${laneId}`;
         const lastFloorLog = this._lastLogTime.get(logKey) || 0;
@@ -172,8 +172,8 @@ class SuperScalp {
         return null;
       }
 
-      // Above $0.55 = breakeven too high — skip
-      const maxAsk = 0.55;
+      // Above $0.56 = breakeven too high — skip
+      const maxAsk = 0.56;
       if (askPrice > maxAsk) {
         const logKey = `ask-cap-${laneId}`;
         const lastCapLog = this._lastLogTime.get(logKey) || 0;

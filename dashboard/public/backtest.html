@@ -244,11 +244,25 @@
         <div class="config-field">
           <label>Timing Points</label>
           <select id="cfgTimings">
-            <option value="standard">20%, 30%, 40%, 50%</option>
-            <option value="early">15%, 20%, 25%, 30%</option>
-            <option value="late">30%, 40%, 50%, 60%</option>
-            <option value="fine">20%, 25%, 30%, 35%, 40%, 45%, 50%</option>
+            <option value="0.10">10% only</option>
+            <option value="0.15">15% only</option>
+            <option value="0.20">20% only</option>
+            <option value="0.25">25% only</option>
+            <option value="0.30">30% only</option>
+            <option value="0.35">35% only</option>
+            <option value="0.40">40% only</option>
+            <option value="0.45">45% only</option>
+            <option value="0.50" selected>50% only</option>
           </select>
+        </div>
+        <div class="config-field">
+          <label>Candles</label>
+          <input type="number" id="numCandles" value="7" min="3" max="30">
+        </div>
+        <div class="config-field">
+          <label>Max Ask Cap %</label>
+          <input type="number" id="maxAskCapPct" value="0" min="0" max="1" step="0.01" placeholder="0 = disabled. 0.05 ≈ real $0.55 cap.">
+          <div style="font-size:11px;color:#4a5568;margin-top:4px;font-family:'JetBrains Mono',monospace;">0 = disabled. 0.05 ≈ real $0.55 cap.</div>
         </div>
       </div>
       <div class="config-actions">
@@ -283,6 +297,12 @@
       <!-- Summary cards -->
       <div class="results-grid" id="summaryCards"></div>
 
+      <!-- Filtered (simulated ASK_CAP) section -->
+      <div id="filteredSection" style="display:none;">
+        <h3 style="font-size:14px;color:#94a3b8;margin:8px 0 12px;text-transform:uppercase;letter-spacing:1px;">Filtered (simulated ASK_CAP)</h3>
+        <div class="results-grid" id="filteredCards"></div>
+      </div>
+
       <!-- Accuracy by Timeframe × Timing Point (the key table) -->
       <div class="results-table-wrap" id="mainTableWrap">
         <h3>Accuracy by Timeframe × Timing Point</h3>
@@ -299,6 +319,15 @@
       <div class="results-table-wrap" id="dirTableWrap">
         <h3>Accuracy by Direction</h3>
         <table id="dirTable"><thead></thead><tbody></tbody></table>
+      </div>
+
+      <!-- By Simulated Ask Band -->
+      <div class="results-table-wrap" id="bandTableWrap">
+        <h3>Accuracy by Simulated Ask Band</h3>
+        <table id="bandTable"><thead></thead><tbody></tbody></table>
+        <div style="padding:10px 20px 14px;font-size:11px;color:#64748b;font-family:'JetBrains Mono',monospace;">
+          EV assumes midpoint ask for each band. Real EV depends on actual fill prices and fees. Bands with n below 20 are noisy — interpret cautiously.
+        </div>
       </div>
 
       <!-- Raw data download -->
@@ -366,12 +395,10 @@ function getConfig() {
   else if (intVal === 'long') intervals = [60, 240];
   else intervals = [parseInt(intVal)];
   const tVal = document.getElementById('cfgTimings').value;
-  let timingPoints;
-  if (tVal === 'standard') timingPoints = [0.20, 0.30, 0.40, 0.50];
-  else if (tVal === 'early') timingPoints = [0.15, 0.20, 0.25, 0.30];
-  else if (tVal === 'late') timingPoints = [0.30, 0.40, 0.50, 0.60];
-  else timingPoints = [0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50];
-  return { assets, intervals, timingPoints, hours };
+  const timingPoints = [parseFloat(tVal)];
+  const numCandles = parseInt(document.getElementById('numCandles').value, 10);
+  const maxAskCapPct = parseFloat(document.getElementById('maxAskCapPct').value) || 0;
+  return { assets, intervals, timingPoints, hours, numCandles, maxAskCapPct };
 }
 
 function updateEstimate() {
@@ -511,10 +538,39 @@ function renderResults(data) {
     </div>
   `;
 
+  // Filtered subset (only if filter was active)
+  const cap = data.config && data.config.maxAskCapPct;
+  const fSection = document.getElementById('filteredSection');
+  if (cap && cap > 0 && data.filtered) {
+    const f = data.filtered;
+    const fAccClass = f.accuracyExWait >= 55 ? 'green' : f.accuracyExWait >= 50 ? 'yellow' : 'red';
+    document.getElementById('filteredCards').innerHTML = `
+      <div class="stat-card">
+        <div class="card-label">Filtered Out</div>
+        <div class="card-value yellow">${f.totalFilteredOut}</div>
+        <div class="card-sub">cap = ${(cap*100).toFixed(2)}% spot move</div>
+      </div>
+      <div class="stat-card">
+        <div class="card-label">Remaining Calls</div>
+        <div class="card-value">${f.totalCalls}</div>
+        <div class="card-sub">after ASK_CAP filter (ex-WAIT)</div>
+      </div>
+      <div class="stat-card">
+        <div class="card-label">Filtered Accuracy (ex-WAIT)</div>
+        <div class="card-value ${fAccClass}">${f.accuracyExWait}%</div>
+        <div class="card-sub">${f.totalCorrect}W / ${f.totalWrong}L</div>
+      </div>
+    `;
+    fSection.style.display = 'block';
+  } else {
+    fSection.style.display = 'none';
+  }
+
   // Main table: Timeframe × Timing
   renderMainTable(data);
   renderAssetTable(data);
   renderDirTable(data);
+  renderBandTable(data);
 }
 
 function findBestCombo(data) {
@@ -595,6 +651,35 @@ function renderAssetTable(data) {
   }
   document.querySelector('#assetTable thead').innerHTML = thead;
   document.querySelector('#assetTable tbody').innerHTML = tbody;
+}
+
+function renderBandTable(data) {
+  const bands = data.byAskBand || {};
+  let thead = '<tr><th>Ask Band</th><th>Calls</th><th>Correct</th><th>Wrong</th><th>Accuracy</th><th>Est. EV/share ($)</th></tr>';
+  let tbody = '';
+  for (let i = 1; i <= 7; i++) {
+    const b = bands[String(i)];
+    if (!b) continue;
+    let accCell;
+    if (b.n === 0) {
+      accCell = '<td style="color:#334155">—</td>';
+    } else {
+      const accColorClass = b.accuracy > 65 ? 'acc-high' : b.accuracy >= 55 ? 'acc-mid' : 'acc-low';
+      accCell = `<td class="${accColorClass}">${b.accuracy}%</td>`;
+    }
+    const evColor = b.estEvPerShare > 0 ? '#00D341' : b.estEvPerShare < 0 ? '#ef4444' : '#94a3b8';
+    const evSign = b.estEvPerShare > 0 ? '+' : '';
+    tbody += `<tr>`
+      + `<td style="font-weight:600">${b.label}</td>`
+      + `<td>${b.n}</td>`
+      + `<td style="color:#00D341">${b.correct}</td>`
+      + `<td style="color:#ef4444">${b.wrong}</td>`
+      + accCell
+      + `<td style="color:${evColor};font-weight:600">${evSign}${b.estEvPerShare.toFixed(3)}</td>`
+      + `</tr>`;
+  }
+  document.querySelector('#bandTable thead').innerHTML = thead;
+  document.querySelector('#bandTable tbody').innerHTML = tbody;
 }
 
 function renderDirTable(data) {

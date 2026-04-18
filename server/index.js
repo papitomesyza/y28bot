@@ -638,7 +638,7 @@ app.get('/api/v2/tiers', auth.authMiddleware, (req, res) => {
 // --- Backtest API ---
 
 app.post('/api/backtest/run', auth.authMiddleware, async (req, res) => {
-  const { assets, intervals, timingPoints, hours } = req.body;
+  const { assets, intervals, timingPoints, hours, numCandles, maxAskCapPct } = req.body;
 
   // Prevent running multiple backtests simultaneously
   if (global._backtestRunning) {
@@ -657,6 +657,8 @@ app.post('/api/backtest/run', auth.authMiddleware, async (req, res) => {
       intervals: intervals || [5, 15, 60, 240],
       timingPoints: timingPoints || [0.20, 0.30, 0.40, 0.50],
       hours: hours || 24,
+      numCandles: (typeof numCandles === 'number' && numCandles >= 3 && numCandles <= 30) ? numCandles : 7,
+      maxAskCapPct: (typeof maxAskCapPct === 'number' && maxAskCapPct >= 0 && maxAskCapPct <= 1) ? maxAskCapPct : 0,
       onProgress: (p) => { global._backtestProgress = p; },
     });
     global._backtestResults = results;

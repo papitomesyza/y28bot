@@ -249,6 +249,8 @@ async function runBacktest(options = {}) {
     intervals = [5, 15, 60, 240],
     timingPoints = [0.20, 0.30, 0.40, 0.50],
     hours = 24,
+    numCandles = 7,
+    maxAskCapPct = 0,
     onProgress = null,
   } = options;
 
@@ -315,7 +317,7 @@ async function runBacktest(options = {}) {
           const snapshotTs = windowStart + elapsedMs;
 
           // Build candle text at this point in time
-          const candleText = buildCandleText(klines, asset, intervalMin, windowStart, elapsedMs, 7);
+          const candleText = buildCandleText(klines, asset, intervalMin, windowStart, elapsedMs, numCandles);
           if (!candleText) continue;
 
           // Call Haiku
@@ -346,6 +348,18 @@ async function runBacktest(options = {}) {
               ? (((priceAtCall - fullCandle.open) / fullCandle.open) * 100)
               : 0;
 
+            let filtered = false;
+            let filterReason = '';
+            if (maxAskCapPct > 0 && prediction !== 'WAIT') {
+              if (prediction === 'UP' && priceDeltaPct > maxAskCapPct) {
+                filtered = true;
+                filterReason = 'ask_cap_exceeded';
+              } else if (prediction === 'DOWN' && priceDeltaPct < -maxAskCapPct) {
+                filtered = true;
+                filterReason = 'ask_cap_exceeded';
+              }
+            }
+
             rawResults.push({
               asset,
               interval: intervalMin,
@@ -359,6 +373,8 @@ async function runBacktest(options = {}) {
               openPrice: fullCandle.open,
               closePrice: fullCandle.close,
               priceDeltaPct: parseFloat(priceDeltaPct.toFixed(4)),
+              filtered,
+              filterReason,
             });
           }
 
@@ -400,6 +416,21 @@ async function runBacktest(options = {}) {
     totalWait,
     accuracy: rawResults.length > 0 ? parseFloat(((totalCorrect / rawResults.length) * 100).toFixed(2)) : 0,
     accuracyExWait: decided.length > 0 ? parseFloat(((totalCorrect / decided.length) * 100).toFixed(2)) : 0,
+  };
+
+  // Filtered subset: signals that would have executed under the simulated ASK_CAP
+  const filteredOutCount = rawResults.filter(r => r.filtered === true).length;
+  const filteredSubset = rawResults.filter(r => r.filtered === false && r.haikuPrediction !== 'WAIT');
+  const fCorrect = filteredSubset.filter(r => r.correct === true).length;
+  const fWrong = filteredSubset.filter(r => r.correct === false).length;
+  const filtered = {
+    totalCalls: filteredSubset.length,
+    totalCorrect: fCorrect,
+    totalWrong: fWrong,
+    totalWait: 0,
+    accuracy: filteredSubset.length > 0 ? parseFloat(((fCorrect / filteredSubset.length) * 100).toFixed(2)) : 0,
+    accuracyExWait: filteredSubset.length > 0 ? parseFloat(((fCorrect / filteredSubset.length) * 100).toFixed(2)) : 0,
+    totalFilteredOut: filteredOutCount,
   };
 
   // By timeframe
@@ -486,6 +517,42 @@ async function runBacktest(options = {}) {
     };
   }
 
+  // By simulated ask band — groups calls by directional delta (signed relative
+  // to Haiku's prediction) as a proxy for where Polymarket's ask would be.
+  const askBands = [
+    { id: 1, label: '$0.30-$0.43 (against)',  min: -Infinity, max: -0.05, askMid: 0.36 },
+    { id: 2, label: '$0.43-$0.48 (small against)', min: -0.05, max: -0.02, askMid: 0.455 },
+    { id: 3, label: '$0.48-$0.52 (flat)',     min: -0.02, max:  0.02, askMid: 0.50 },
+    { id: 4, label: '$0.52-$0.58 (small with)', min:  0.02, max:  0.05, askMid: 0.55 },
+    { id: 5, label: '$0.58-$0.68 (medium with)', min: 0.05, max:  0.10, askMid: 0.63 },
+    { id: 6, label: '$0.68-$0.82 (large with)',  min: 0.10, max:  0.20, askMid: 0.75 },
+    { id: 7, label: '$0.82+ (extreme with)',    min: 0.20, max:  Infinity, askMid: 0.85 },
+  ];
+
+  const byAskBand = {};
+  for (const band of askBands) {
+    const inBand = rawResults.filter(r => {
+      if (r.haikuPrediction === 'WAIT') return false;
+      const directional = r.haikuPrediction === 'UP' ? r.priceDeltaPct : -r.priceDeltaPct;
+      // Lower bound inclusive for id=1 (handled by -Infinity), exclusive elsewhere;
+      // upper bound exclusive except id=7 (handled by +Infinity).
+      return directional >= band.min && directional < band.max;
+    });
+    const bCorrect = inBand.filter(r => r.correct === true).length;
+    const bWrong = inBand.filter(r => r.correct === false).length;
+    const accFrac = inBand.length > 0 ? bCorrect / inBand.length : 0;
+    const ev = accFrac * (1 - band.askMid) - (1 - accFrac) * band.askMid;
+
+    byAskBand[String(band.id)] = {
+      label: band.label,
+      n: inBand.length,
+      correct: bCorrect,
+      wrong: bWrong,
+      accuracy: inBand.length > 0 ? parseFloat(((bCorrect / inBand.length) * 100).toFixed(2)) : 0,
+      estEvPerShare: parseFloat(ev.toFixed(3)),
+    };
+  }
+
   // Estimate cost
   const estInputTokens = rawResults.length * 350; // ~350 tokens per prompt
   const estOutputTokens = rawResults.length * 3;   // ~3 tokens per response
@@ -497,16 +564,20 @@ async function runBacktest(options = {}) {
 
   return {
     summary,
+    filtered,
     byTimeframe,
     byTimingPoint,
     byAsset,
     byDirection,
+    byAskBand,
     rawResults,
     config: {
       assets,
       intervals,
       timingPoints,
       hours,
+      numCandles,
+      maxAskCapPct,
       startTime: new Date(startMs).toISOString(),
       endTime: new Date(endMs).toISOString(),
     },
